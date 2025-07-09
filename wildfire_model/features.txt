@@ -1,0 +1,3 @@
+Tasks: 
+1. Base on the active learning algorith, we'd run the infernece and augumentation
+at the edge and run the fine-tune in the data center.

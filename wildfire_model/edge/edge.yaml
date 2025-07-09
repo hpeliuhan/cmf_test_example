@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wildfire-config
+data:
+  # Flask configuration
+  FLASK_ENV: "production"
+  UPLOAD_FOLDER: "/app/videos"
+  RESULTS_FOLDER: "/app/results"
+  MODEL_CACHE_DIR: "/app/models"
+  MAX_FILE_SIZE: "104857600"  # 100MB in bytes
+  GITHUB_DOWNLOAD_TIMEOUT: "300"  # 5 minutes
+  
+  # TensorFlow configuration
+  TF_CPP_MIN_LOG_LEVEL: "2"
+  TF_ENABLE_ONEDNN_OPTS: "0"
+  
+  # Logging
+  LOG_LEVEL: "INFO"
+  MAX_LOG_ENTRIES: "1000"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wildfire-models-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wifire-al
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wifire-al
+  template:
+    metadata:
+      labels:
+        app: wifire-al
+    spec:
+      # Add security context at pod level
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+        
+      containers:
+      - name: wifire-al
+        image: localhost:5000/wifire-al:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5000
+        
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TF_CPP_MIN_LOG_LEVEL
+          value: "2"
+        
+        # Mount the PVC
+        volumeMounts:
+        - name: models-storage
+          mountPath: /app/models
+        
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        
+        # Container security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      
+      volumes:
+      - name: models-storage
+        persistentVolumeClaim:
+          claimName: wildfire-models-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wifire-al
+spec:
+  selector:
+    app: wifire-al
+  type: LoadBalancer
+  ports:
+    - port: 5001
+      targetPort: 5000
+
