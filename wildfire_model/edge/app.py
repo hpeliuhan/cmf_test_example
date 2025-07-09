@@ -45,6 +45,16 @@ except ImportError as e:
     print(f"❌ Requests import error: {e}")
     sys.exit(1)
 
+# Try to import custom modules from correct paths
+try:
+    from python_modules.model_management.model_manager import ModelManager
+    from python_modules.inference_engine.inference_engine import InferenceEngine
+    print("✅ Custom modules imported successfully")
+except ImportError as e:
+    print(f"❌ Custom module import error: {e}")
+    print("Make sure python_modules/model_management/model_manager.py and python_modules/inference_engine/inference_engine.py exist")
+    sys.exit(1)
+
 # Continue with other imports
 from werkzeug.utils import secure_filename
 import uuid
@@ -57,6 +67,7 @@ import time
 import logging
 from PIL import Image
 import glob
+import hashlib
 
 print("✅ All imports successful")
 
@@ -64,13 +75,13 @@ print("✅ All imports successful")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates', static_folder='static')
 
 # Configuration from environment variables with defaults
 UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', './videos')
 RESULTS_FOLDER = os.getenv('RESULTS_FOLDER', './results')
 MODEL_CACHE_DIR = os.getenv('MODEL_CACHE_DIR', './models')
-FRAMES_FOLDER = os.getenv('FRAMES_FOLDER', './frames')  # New folder for extracted frames
+FRAMES_FOLDER = os.getenv('FRAMES_FOLDER', './frames')
 MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', 100 * 1024 * 1024))
 GITHUB_DOWNLOAD_TIMEOUT = int(os.getenv('GITHUB_DOWNLOAD_TIMEOUT', 300))
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv', 'wmv'}
@@ -89,6 +100,8 @@ try:
     os.makedirs(RESULTS_FOLDER, exist_ok=True)
     os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
     os.makedirs(FRAMES_FOLDER, exist_ok=True)
+    os.makedirs('templates', exist_ok=True)
+    os.makedirs('static', exist_ok=True)
     print("✅ Directories created successfully")
 except Exception as e:
     print(f"❌ Error creating directories: {e}")
@@ -98,325 +111,192 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['RESULTS_FOLDER'] = RESULTS_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
-# Global variables
+# Initialize our modular components
+model_manager = ModelManager(MODEL_CACHE_DIR, logger)
+inference_engine = InferenceEngine(FRAMES_FOLDER, logger)
+
+# Global variables for Flask app state
 model = None
 inference_queue = Queue()
 inference_status = {}
 system_logs = deque(maxlen=1000)
+detailed_logs = deque(maxlen=5000)
 active_jobs = {}
 model_url = None
-model_download_status = {}
+model_download_status = {
+    'status': 'idle',
+    'progress': 0,
+    'message': '',
+    'last_updated': datetime.now().isoformat()
+}
+current_inference_logs = {}
 
-def log_message(level, message, job_id=None):
-    """Add log message to system logs"""
+# Import BasicVideoInference
+try:
+    from python_modules.inference_engine.basic_inference import BasicVideoInference
+    print("✅ BasicVideoInference imported successfully")
+except ImportError as e:
+    print(f"❌ BasicVideoInference import error: {e}")
+    BasicVideoInference = None
+
+def log_message(level, message, job_id=None, category='SYSTEM'):
+    """Enhanced log message function with categories and detailed tracking"""
+    timestamp = datetime.now().isoformat()
+    
     log_entry = {
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': timestamp,
         'level': level,
         'message': message,
-        'job_id': job_id
+        'job_id': job_id,
+        'category': category,
+        'thread_name': threading.current_thread().name
     }
-    system_logs.append(log_entry)
-    print(f"[{level}] {message}")
     
-    # Also log to logger
-    if level == "ERROR":
-        logger.error(message)
-    elif level == "WARNING":
-        logger.warning(message)
-    else:
-        logger.info(message)
+    # Add to system logs (short)
+    system_logs.append(log_entry)
+    
+    # Add to detailed logs (longer retention)
+    detailed_logs.append(log_entry)
+    
+    # If it's an inference job, also store in job-specific logs
+    if job_id and job_id in active_jobs:
+        if 'logs' not in active_jobs[job_id]:
+            active_jobs[job_id]['logs'] = []
+        active_jobs[job_id]['logs'].append(log_entry)
+    
+    # Also log to standard logger
+    getattr(logger, level.lower(), logger.info)(f"[{category}] {message}")
+
+def get_model_basic_info():
+    """Get basic model information"""
+    if model is None:
+        return {'loaded': False}
+    
+    try:
+        return {
+            'loaded': True,
+            'input_shape': str(model.input_shape),
+            'output_shape': str(model.output_shape),
+            'parameters': model.count_params()
+        }
+    except Exception as e:
+        return {
+            'loaded': True,
+            'error': f'Error getting model info: {str(e)}'
+        }
+
+def get_model_detailed_info():
+    """Get detailed model information"""
+    if model is None:
+        return {
+            'loaded': False,
+            'error': 'No model loaded'
+        }
+    
+    try:
+        # Get basic info from model manager
+        basic_info = model_manager.get_model_info()
+        
+        # Add additional detailed information
+        detailed_info = {
+            'loaded': True,
+            'model_type': type(model).__name__,
+            'input_shape': str(model.input_shape) if hasattr(model, 'input_shape') else 'Unknown',
+            'output_shape': str(model.output_shape) if hasattr(model, 'output_shape') else 'Unknown',
+            'total_params': model.count_params() if hasattr(model, 'count_params') else 'Unknown',
+            'trainable_params': sum([tf.keras.utils.count_params(w) for w in model.trainable_weights]) if hasattr(model, 'trainable_weights') else 'Unknown',
+            'non_trainable_params': sum([tf.keras.utils.count_params(w) for w in model.non_trainable_weights]) if hasattr(model, 'non_trainable_weights') else 'Unknown',
+            'layers': len(model.layers) if hasattr(model, 'layers') else 'Unknown',
+            'model_size_mb': get_model_size_mb(),
+            'model_path': getattr(model_manager, 'current_model_path', 'Unknown'),
+            'loaded_at': datetime.now().isoformat()
+        }
+        
+        return detailed_info
+        
+    except Exception as e:
+        return {
+            'loaded': True,
+            'error': f'Error getting detailed model info: {str(e)}'
+        }
+
+def get_model_size_mb():
+    """Get approximate model size in MB"""
+    try:
+        if model is None:
+            return 0
+        
+        # Calculate approximate size based on parameters
+        total_params = model.count_params()
+        # Assuming float32 (4 bytes per parameter)
+        size_bytes = total_params * 4
+        size_mb = size_bytes / (1024 * 1024)
+        return round(size_mb, 2)
+        
+    except Exception as e:
+        return 0
 
 def allowed_file(filename):
     """Check if uploaded file has allowed extension"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def get_image_files(test_dir: str, exclude_bases=None):
-    """Get all image files from directory, excluding specified base names"""
-    if exclude_bases is None:
-        exclude_bases = set()
-    
-    image_files = []
-    for ext in IMAGE_EXTENSIONS:
-        pattern = os.path.join(test_dir, f"*.{ext}")
-        image_files.extend(glob.glob(pattern, recursive=False))
-        # Also check uppercase
-        pattern = os.path.join(test_dir, f"*.{ext.upper()}")
-        image_files.extend(glob.glob(pattern, recursive=False))
-    
-    # Filter out excluded files
-    filtered_files = []
-    for f in image_files:
-        base_name = os.path.splitext(os.path.basename(f))[0]
-        if base_name not in exclude_bases:
-            filtered_files.append(f)
-    
-    logger.info(f"Found {len(filtered_files)} image files in {test_dir}")
-    return sorted(filtered_files)
-
-def preprocess_image(image_path, target_size=(224, 224)):
-    """Preprocess single image for model input"""
+def analyze_video_with_basic_inference(video_path, job_id):
+    """Analyze video using BasicVideoInference"""
     try:
-        # Load image using PIL
-        image = Image.open(image_path)
-        
-        # Convert to RGB if needed
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Resize image
-        image = image.resize(target_size)
-        
-        # Convert to numpy array
-        img_array = np.array(image)
-        
-        # Normalize to [0, 1]
-        img_array = img_array.astype(np.float32) / 255.0
-        
-        # Add batch dimension
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        return img_array
-        
-    except Exception as e:
-        logger.error(f"Error preprocessing image {image_path}: {e}")
-        return None
-
-def run_inference(model, test_dir: str, exclude_bases=None) -> pd.DataFrame:
-    """
-    Your original inference function - run inference on images in a directory
-    """
-    logger.info(f"Running inference on {test_dir} (excluding {len(exclude_bases) if exclude_bases else 0} files)")
-    
-    files = get_image_files(test_dir, exclude_bases=exclude_bases)
-    results = []
-    out_units = model.output_shape[-1]
-    
-    for f in files:
-        try:
-            probs = model.predict(preprocess_image(f), verbose=0).flatten()
-            if out_units == 1:
-                prob = float(probs[0])
-                pred = int(prob > 0.5)
-            else:
-                pred = int(np.argmax(probs))
-                prob = float(probs[pred])
-            
-            results.append({
-                'image': os.path.basename(f), 
-                'pred': pred, 
-                'prob': prob,
-                'image_path': f
-            })
-            
-        except Exception as e:
-            logger.error(f"Error processing image {f}: {e}")
-            # Add failed result
-            results.append({
-                'image': os.path.basename(f), 
-                'pred': -1, 
-                'prob': 0.0,
-                'image_path': f,
-                'error': str(e)
-            })
-    
-    df = pd.DataFrame(results)
-    logger.info(f"Completed inference: {len(df)} samples")
-    return df
-
-def extract_frames_from_video(video_path, output_dir, frame_interval=30):
-    """Extract frames from video for inference"""
-    try:
-        # Create output directory for this video
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        video_frames_dir = os.path.join(output_dir, video_name)
-        os.makedirs(video_frames_dir, exist_ok=True)
-        
-        # Open video
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise Exception(f"Cannot open video file: {video_path}")
-        
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        
-        logger.info(f"Extracting frames from {video_path}: {total_frames} total frames, {fps} FPS")
-        
-        frame_count = 0
-        saved_frames = 0
-        extracted_files = []
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Save every nth frame
-            if frame_count % frame_interval == 0:
-                timestamp = frame_count / fps
-                frame_filename = f"frame_{frame_count:06d}_t{timestamp:.2f}s.jpg"
-                frame_path = os.path.join(video_frames_dir, frame_filename)
-                
-                # Save frame
-                cv2.imwrite(frame_path, frame)
-                extracted_files.append(frame_path)
-                saved_frames += 1
-            
-            frame_count += 1
-        
-        cap.release();
-        
-        logger.info(f"Extracted {saved_frames} frames to {video_frames_dir}")
-        return video_frames_dir, extracted_files
-        
-    except Exception as e:
-        logger.error(f"Error extracting frames from {video_path}: {e}")
-        raise
-
-def analyze_video_with_inference(video_path, job_id):
-    """Analyze video using your run_inference function"""
-    global model
-    
-    try:
-        log_message("INFO", f"Starting video analysis: {video_path}", job_id)
+        log_message("INFO", f"Starting video analysis with BasicVideoInference", job_id)
         
         if model is None:
             raise Exception("No model loaded")
         
+        if BasicVideoInference is None:
+            raise Exception("BasicVideoInference not available")
+        
         # Update job status
         active_jobs[job_id]['status'] = 'processing'
+        active_jobs[job_id]['current_stage'] = 'Starting inference'
         active_jobs[job_id]['progress'] = 10
         
-        # Extract frames from video
-        log_message("INFO", "Extracting frames from video...", job_id)
-        frames_dir, extracted_files = extract_frames_from_video(
-            video_path, 
-            FRAMES_FOLDER, 
-            frame_interval=30  # Extract every 30th frame
+        # Create BasicVideoInference instance
+        frames_dir = os.path.join(FRAMES_FOLDER, job_id)
+        basic_inference = BasicVideoInference(
+            model=model,
+            frames_output_dir=frames_dir,
+            logger=logger
         )
         
-        active_jobs[job_id]['progress'] = 30
-        active_jobs[job_id]['frames_extracted'] = len(extracted_files)
-        
-        # Run inference on extracted frames using your function
-        log_message("INFO", f"Running inference on {len(extracted_files)} frames...", job_id)
-        
-        # Use your original run_inference function
-        inference_results = run_inference(model, frames_dir, exclude_bases=None)
-        
-        active_jobs[job_id]['progress'] = 80
-        
-        # Process results
-        video_results = process_inference_results(inference_results, video_path, job_id)
-        
-        # Save results
-        results_filename = f"analysis_{job_id}.json"
-        results_path = os.path.join(RESULTS_FOLDER, results_filename)
-        
-        with open(results_path, 'w') as f:
-            json.dump(video_results, f, indent=2)
-        
-        # Also save DataFrame as CSV
-        csv_path = os.path.join(RESULTS_FOLDER, f"inference_{job_id}.csv")
-        inference_results.to_csv(csv_path, index=False)
+        # Run inference with frame-based extraction for comprehensive analysis
+        # Extract every 5th frame with increased frame limit for more coverage
+        results = basic_inference.process_video(
+            video_path, 
+            frame_interval=5,   # Extract every 5th frame instead of 30th
+            max_frames=200,     # Increase to 200 frames for better coverage
+            job_id=job_id
+        )
         
         # Update job status
         active_jobs[job_id]['status'] = 'completed'
+        active_jobs[job_id]['current_stage'] = 'Analysis complete'
         active_jobs[job_id]['progress'] = 100
-        active_jobs[job_id]['results'] = video_results
-        active_jobs[job_id]['results_file'] = results_path
-        active_jobs[job_id]['csv_file'] = csv_path
-        active_jobs[job_id]['frames_dir'] = frames_dir
+        active_jobs[job_id]['results'] = results
+        active_jobs[job_id]['completed_at'] = datetime.now().isoformat()
         
-        log_message("SUCCESS", f"Video analysis completed. Results saved to: {results_path}", job_id)
-        
-        return video_results
+        log_message("SUCCESS", f"Video analysis completed successfully", job_id)
+        return results
         
     except Exception as e:
-        error_msg = f"Video analysis failed: {str(e)}"
+        error_msg = f"Error in video analysis: {str(e)}"
         log_message("ERROR", error_msg, job_id)
         
         # Update job status
         active_jobs[job_id]['status'] = 'failed'
+        active_jobs[job_id]['current_stage'] = 'Failed'
         active_jobs[job_id]['error'] = error_msg
+        active_jobs[job_id]['failed_at'] = datetime.now().isoformat()
         
-        return None
-
-def process_inference_results(df: pd.DataFrame, video_path: str, job_id: str):
-    """Process the inference DataFrame into video analysis results"""
-    
-    # Get video info
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
-    fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 30
-    duration = total_frames / fps if fps > 0 else 0
-    cap.release()
-    
-    # Analyze results
-    wildfire_detections = df[df['pred'] == 1] if 'pred' in df.columns else pd.DataFrame()
-    detection_threshold = 0.5  # Can be adjusted
-    
-    # Extract timestamps from frame names
-    detections_list = []
-    for _, row in wildfire_detections.iterrows():
-        try:
-            # Extract timestamp from filename like "frame_000030_t1.00s.jpg"
-            filename = row['image']
-            if '_t' in filename and 's.jpg' in filename:
-                timestamp_str = filename.split('_t')[1].split('s.jpg')[0]
-                timestamp = float(timestamp_str)
-            else:
-                # Fallback: estimate from frame number
-                frame_num = int(filename.split('_')[1]) if '_' in filename else 0
-                timestamp = frame_num / fps
-            
-            detection = {
-                'frame_file': filename,
-                'timestamp': timestamp,
-                'fire_confidence': float(row['prob']),
-                'prediction': int(row['pred']),
-                'alert_level': 'HIGH' if row['prob'] > 0.8 else 'MEDIUM',
-                'image_path': row.get('image_path', '')
-            }
-            detections_list.append(detection)
-            
-        except Exception as e:
-            logger.error(f"Error processing detection row: {e}")
-    
-    # Calculate summary statistics
-    confidence_scores = df['prob'].tolist() if 'prob' in df.columns else []
-    
-    results = {
-        'job_id': job_id,
-        'video_path': video_path,
-        'analysis_method': 'frame_extraction_inference',
-        'total_frames_analyzed': len(df),
-        'original_video_frames': total_frames,
-        'fps': fps,
-        'duration': duration,
-        'model_info': {
-            'output_units': model.output_shape[-1] if model else 'unknown',
-            'input_shape': str(model.input_shape) if model else 'unknown'
-        },
-        'detections': detections_list,
-        'summary': {
-            'wildfire_detected': len(wildfire_detections) > 0,
-            'total_detections': len(wildfire_detections),
-            'confidence_scores': confidence_scores,
-            'detection_timestamps': [d['timestamp'] for d in detections_list],
-            'high_risk_frames': len([d for d in detections_list if d['fire_confidence'] > 0.8]),
-            'average_confidence': float(np.mean(confidence_scores)) if confidence_scores else 0.0,
-            'max_confidence': float(np.max(confidence_scores)) if confidence_scores else 0.0,
-            'risk_percentage': (len(wildfire_detections) / len(df)) * 100 if len(df) > 0 else 0.0
-        },
-        'inference_dataframe': df.to_dict('records')  # Include full DataFrame data
-    }
-    
-    log_message("INFO", f"Processed results: {len(wildfire_detections)} detections out of {len(df)} frames", job_id)
-    
-    return results
+        raise e
 
 def inference_worker():
-    """Background worker for processing inference queue"""
+    """Background worker for processing inference jobs"""
     log_message("INFO", "Inference worker started")
     
     while True:
@@ -428,36 +308,37 @@ def inference_worker():
                 
                 log_message("INFO", f"Processing job {job_id}", job_id)
                 
-                # Analyze video using your inference method
-                results = analyze_video_with_inference(video_path, job_id)
+                # Run inference
+                analyze_video_with_basic_inference(video_path, job_id)
                 
+                # Mark task as done
                 inference_queue.task_done()
+                
             else:
                 time.sleep(1)
                 
         except Exception as e:
-            log_message("ERROR", f"Inference worker error: {e}")
+            log_message("ERROR", f"Inference worker error: {str(e)}")
             time.sleep(5)
 
-# [Include all your model loading functions from before - download_model_from_github, validate_model_file, etc.]
-# ... (keeping the same model loading functions as before)
+# [Keep all your existing model loading functions...]
 
 def download_model_from_github(url, destination_path):
-    """Download model from GitHub URL (same as before)"""
+    """Download model from GitHub URL"""
     try:
-        log_message("INFO", f"Starting download from: {url}")
+        log_message("INFO", f"Starting download from: {url}", None, "DOWNLOAD")
         
         # Convert blob URL to raw URL if needed
         if '/blob/' in url:
             raw_url = url.replace('/blob/', '/raw/')
-            log_message("INFO", f"Converted to raw URL: {raw_url}")
+            log_message("INFO", f"Converted to raw URL: {raw_url}", None, "DOWNLOAD")
         else:
             raw_url = url
         
         # Download the file
         response = requests.get(raw_url, stream=True, timeout=60)
         
-        log_message("INFO", f"Response status: {response.status_code}")
+        log_message("INFO", f"Response status: {response.status_code}", None, "DOWNLOAD")
         
         if response.status_code == 200:
             # Ensure destination directory exists
@@ -476,10 +357,10 @@ def download_model_from_github(url, destination_path):
                         # Log progress for large files
                         if total_size > 0 and downloaded_size % (1024 * 1024) == 0:  # Every MB
                             progress = (downloaded_size / total_size) * 100
-                            log_message("INFO", f"Download progress: {progress:.1f}% ({downloaded_size}/{total_size} bytes)")
+                            log_message("INFO", f"Download progress: {progress:.1f}% ({downloaded_size}/{total_size} bytes)", None, "DOWNLOAD")
             
             final_size = os.path.getsize(destination_path)
-            log_message("SUCCESS", f"✅ Model downloaded successfully: {destination_path} ({final_size} bytes)")
+            log_message("SUCCESS", f"✅ Model downloaded successfully: {destination_path} ({final_size} bytes)", None, "DOWNLOAD")
             
             return {
                 'success': True,
@@ -490,7 +371,7 @@ def download_model_from_github(url, destination_path):
             }
         else:
             error_msg = f"Failed to download. Status code: {response.status_code}"
-            log_message("ERROR", error_msg)
+            log_message("ERROR", error_msg, None, "DOWNLOAD")
             return {
                 'success': False,
                 'error': error_msg,
@@ -499,7 +380,7 @@ def download_model_from_github(url, destination_path):
             
     except requests.exceptions.RequestException as e:
         error_msg = f"Network error downloading from {url}: {str(e)}"
-        log_message("ERROR", error_msg)
+        log_message("ERROR", error_msg, None, "DOWNLOAD")
         return {
             'success': False,
             'error': error_msg,
@@ -507,7 +388,7 @@ def download_model_from_github(url, destination_path):
         }
     except Exception as e:
         error_msg = f"Error downloading from {url}: {str(e)}"
-        log_message("ERROR", error_msg)
+        log_message("ERROR", error_msg, None, "DOWNLOAD")
         return {
             'success': False,
             'error': error_msg,
@@ -515,7 +396,7 @@ def download_model_from_github(url, destination_path):
         }
 
 def validate_model_file(filepath):
-    """Validate downloaded model file (same as before)"""
+    """Validate downloaded model file"""
     try:
         if not os.path.exists(filepath):
             return {
@@ -526,7 +407,7 @@ def validate_model_file(filepath):
         file_size = os.path.getsize(filepath)
         file_ext = os.path.splitext(filepath)[1].lower()
         
-        log_message("INFO", f"Validating model: {filepath} ({file_size} bytes, {file_ext})")
+        log_message("INFO", f"Validating model: {filepath} ({file_size} bytes, {file_ext})", None, "VALIDATION")
         
         # Check file size
         if file_size < 1024:  # Less than 1KB
@@ -559,9 +440,9 @@ def validate_model_file(filepath):
                 model_info = {
                     'input_shape': str(test_model.input_shape) if hasattr(test_model, 'input_shape') else 'Unknown',
                     'output_shape': str(test_model.output_shape) if hasattr(test_model, 'output_shape') else 'Unknown',
-                    'parameters': test_model.count_params() if hasattr(test_model, 'count_params') else 'Unknown'
+                    'parameters': model.count_params() if hasattr(test_model, 'count_params') else 'Unknown'
                 }
-                log_message("SUCCESS", f"✅ Model validation successful: {model_info}")
+                log_message("SUCCESS", f"✅ Model validation successful: {model_info}", None, "VALIDATION")
                 return {
                     'valid': True,
                     'file_size': file_size,
@@ -590,13 +471,13 @@ def validate_model_file(filepath):
         }
 
 def load_model_from_url(github_url, force_download=False):
-    """Load model from GitHub URL (same as before)"""
+    """Load model from GitHub URL"""
     global model, model_url, model_download_status
     
     model_url = github_url
     
     try:
-        log_message("INFO", f"Loading model from GitHub: {github_url}")
+        log_message("INFO", f"Loading model from GitHub: {github_url}", None, "MODEL_LOAD")
         
         # Update download status
         model_download_status = {
@@ -615,7 +496,7 @@ def load_model_from_url(github_url, force_download=False):
         
         # Check if file already exists and force_download is False
         if os.path.exists(model_path) and not force_download:
-            log_message("INFO", f"Model file already exists: {model_path}")
+            log_message("INFO", f"Model file already exists: {model_path}", None, "MODEL_LOAD")
             download_result = {
                 'success': True,
                 'filepath': model_path,
@@ -632,13 +513,13 @@ def load_model_from_url(github_url, force_download=False):
                 'status': 'error',
                 'error': download_result['error']
             }
-            log_message("ERROR", f"Model download failed: {download_result['error']}")
+            log_message("ERROR", f"Model download failed: {download_result['error']}", None, "MODEL_LOAD")
             return False
         
         model_path = download_result['filepath']
         
         # Validate model
-        log_message("INFO", "Validating downloaded model...")
+        log_message("INFO", "Validating downloaded model...", None, "MODEL_LOAD")
         validation_result = validate_model_file(model_path)
         
         if not validation_result['valid']:
@@ -646,12 +527,20 @@ def load_model_from_url(github_url, force_download=False):
                 'status': 'error',
                 'error': f"Model validation failed: {validation_result['error']}"
             }
-            log_message("ERROR", f"Model validation failed: {validation_result['error']}")
+            log_message("ERROR", f"Model validation failed: {validation_result['error']}", None, "MODEL_LOAD")
             return False
         
         # Load model
-        log_message("INFO", "Loading validated model...")
+        log_message("INFO", "Loading validated model...", None, "MODEL_LOAD")
         model = tf.keras.models.load_model(model_path)
+        
+        # Log detailed model information
+        log_model_details(model, {
+            'source': github_url,
+            'filepath': model_path,
+            'file_size': download_result['file_size'],
+            'downloaded': download_result['downloaded']
+        })
         
         model_download_status = {
             'status': 'completed',
@@ -663,7 +552,7 @@ def load_model_from_url(github_url, force_download=False):
             'message': 'Model loaded successfully'
         }
         
-        log_message("SUCCESS", f"Model loaded successfully from {github_url}")
+        log_message("SUCCESS", f"Model loaded successfully from {github_url}", None, "MODEL_LOAD")
         return True
         
     except Exception as e:
@@ -672,7 +561,7 @@ def load_model_from_url(github_url, force_download=False):
             'status': 'error',
             'error': error_msg
         }
-        log_message("ERROR", error_msg)
+        log_message("ERROR", error_msg, None, "MODEL_LOAD")
         return False
 
 def create_dummy_model():
@@ -683,10 +572,10 @@ def create_dummy_model():
             tf.keras.layers.GlobalAveragePooling2D(),
             tf.keras.layers.Dense(2, activation='softmax')
         ])
-        log_message("INFO", "Dummy model created successfully")
+        log_message("INFO", "Dummy model created successfully", None, "MODEL")
         return model
     except Exception as e:
-        log_message("ERROR", f"Failed to create dummy model: {e}")
+        log_message("ERROR", f"Failed to create dummy model: {e}", None, "MODEL")
         return None
 
 def load_initial_model():
@@ -699,88 +588,472 @@ def load_initial_model():
     try:
         if os.path.exists(local_model_path):
             model = tf.keras.models.load_model(local_model_path)
-            log_message("INFO", f"Model loaded from local file: {local_model_path}")
+            log_message("INFO", f"Model loaded from local file: {local_model_path}", None, "MODEL")
+            log_model_details(model, {'source': local_model_path})
             return True
     except Exception as e:
-        log_message("WARNING", f"Failed to load local model: {e}")
+        log_message("WARNING", f"Failed to load local model: {e}", None, "MODEL")
     
     # Create dummy model as fallback
     model = create_dummy_model()
+    if model:
+        log_model_details(model, {'source': 'dummy_model'})
     return model is not None
 
-# Flask Routes - Video Analysis
-@app.route('/upload_and_analyze', methods=['POST'])
-def upload_and_analyze():
-    """Upload video and start analysis using run_inference method"""
+def log_model_details(model, info):
+    """Log model details for debugging"""
     try:
-        # Check if model is loaded
         if model is None:
-            return jsonify({
-                'success': False,
-                'error': 'No model loaded. Please load a model first.'
-            }), 400
+            log_message("INFO", "Model is None")
+            return
         
-        # Check if file is in request
-        if 'video' not in request.files:
-            return jsonify({
-                'success': False,
-                'error': 'No video file provided'
-            }), 400
+        log_message("INFO", f"Model loaded: {info}")
+        log_message("INFO", f"Model type: {type(model).__name__}")
         
-        file = request.files['video']
+        if hasattr(model, 'input_shape'):
+            log_message("INFO", f"Input shape: {model.input_shape}")
+        if hasattr(model, 'output_shape'):
+            log_message("INFO", f"Output shape: {model.output_shape}")
+        if hasattr(model, 'count_params'):
+            log_message("INFO", f"Parameters: {model.count_params()}")
+            
+    except Exception as e:
+        log_message("ERROR", f"Error logging model details: {e}")
+
+# Flask Routes
+
+@app.route('/logs')
+def logs_page():
+    """Comprehensive logging display page"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>🔍 Wildfire Detection - Live Logs</title>
+        <style>
+            body { 
+                font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; 
+                margin: 0; 
+                padding: 20px; 
+                background: #1a1a1a; 
+                color: #e0e0e0; 
+            }
+            .container { max-width: 1400px; margin: 0 auto; }
+            .header { 
+                background: #2d2d2d; 
+                padding: 20px; 
+                border-radius: 8px; 
+                margin-bottom: 20px;
+                border-left: 4px solid #ff6b35;
+            }
+            .controls { 
+                background: #2d2d2d; 
+                padding: 15px; 
+                border-radius: 8px; 
+                margin-bottom: 20px;
+                display: flex;
+                gap: 10px;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+            .log-container { 
+                background: #1e1e1e; 
+                border: 1px solid #444; 
+                border-radius: 8px; 
+                height: 600px; 
+                overflow-y: auto; 
+                padding: 15px;
+                font-size: 13px;
+                line-height: 1.4;
+            }
+            .log-entry { 
+                margin-bottom: 8px; 
+                padding: 6px 8px; 
+                border-radius: 4px;
+                border-left: 3px solid #555;
+                background: rgba(255,255,255,0.02);
+            }
+            .log-entry:hover { background: rgba(255,255,255,0.05); }
+            
+            /* Log level colors */
+            .ERROR { border-left-color: #ff4757; background: rgba(255,71,87,0.1); }
+            .WARNING { border-left-color: #ffa502; background: rgba(255,165,2,0.1); }
+            .SUCCESS { border-left-color: #2ed573; background: rgba(46,213,115,0.1); }
+            .INFO { border-left-color: #3742fa; background: rgba(55,66,250,0.1); }
+            
+            /* Category colors */
+            .SYSTEM { border-left-color: #747d8c; }
+            .MODEL { border-left-color: #5f27cd; }
+            .INFERENCE { border-left-color: #00d2d3; }
+            .FRAMES { border-left-color: #ff9ff3; }
+            .ANALYSIS { border-left-color: #54a0ff; }
+            .PREDICTION { border-left-color: #ff6348; }
+            .DOWNLOAD { border-left-color: #2ed573; }
+            .WORKER { border-left-color: #ff7675; }
+            .PROCESSING { border-left-color: #a29bfe; }
+            .STATS { border-left-color: #fd79a8; }
+            .DETECTION { border-left-color: #e84393; background: rgba(232,67,147,0.15); }
+            .SUMMARY { border-left-color: #00cec9; background: rgba(0,206,201,0.1); }
+            
+            .timestamp { color: #888; font-size: 11px; }
+            .level { 
+                font-weight: bold; 
+                padding: 2px 6px; 
+                border-radius: 3px; 
+                font-size: 10px;
+                margin-right: 8px;
+            }
+            .category { 
+                color: #74b9ff; 
+                font-weight: bold; 
+                margin-right: 8px;
+                font-size: 11px;
+            }
+            .job-id { 
+                color: #fd79a8; 
+                font-family: monospace; 
+                margin-right: 8px;
+                font-size: 11px;
+            }
+            .message { color: #e0e0e0; }
+            
+            .btn { 
+                background: #74b9ff; 
+                color: white; 
+                border: none; 
+                padding: 8px 15px; 
+                border-radius: 4px; 
+                cursor: pointer;
+                font-size: 12px;
+            }
+            .btn:hover { background: #0984e3; }
+            .btn.active { background: #00b894; }
+            
+            select, input { 
+                background: #2d2d2d; 
+                color: #e0e0e0; 
+                border: 1px solid #555; 
+                padding: 6px 10px; 
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            
+            .stats { 
+                display: flex; 
+                gap: 20px; 
+                margin-bottom: 15px;
+                flex-wrap: wrap;
+            }
+            .stat-item { 
+                background: #2d2d2d; 
+                padding: 10px 15px; 
+                border-radius: 6px; 
+                text-align: center;
+                min-width: 80px;
+            }
+            .stat-value { 
+                font-size: 18px; 
+                font-weight: bold; 
+                color: #74b9ff; 
+            }
+            .stat-label { 
+                font-size: 11px; 
+                color: #888; 
+                text-transform: uppercase;
+            }
+            
+            .model-info {
+                background: #2d2d2d;
+                padding: 15px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                border-left: 4px solid #5f27cd;
+            }
+            
+            .auto-scroll {
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                background: #74b9ff;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 50%;
+                cursor: pointer;
+                font-size: 16px;
+                width: 50px;
+                height: 50px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🔍 Wildfire Detection - Live Inference Logs</h1>
+                <p>Real-time monitoring of model loading, inference execution, and analysis results</p>
+            </div>
+            
+            <div class="model-info">
+                <h3>🤖 Current Model Information</h3>
+                <div id="modelInfo">Loading model information...</div>
+            </div>
+            
+            <div class="stats">
+                <div class="stat-item">
+                    <div class="stat-value" id="totalLogs">0</div>
+                    <div class="stat-label">Total Logs</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="activeJobs">0</div>
+                    <div class="stat-label">Active Jobs</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="errorCount">0</div>
+                    <div class="stat-label">Errors</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="detectionCount">0</div>
+                    <div class="stat-label">Detections</div>
+                </div>
+            </div>
+            
+            <div class="controls">
+                <button id="autoRefresh" class="btn active" onclick="toggleAutoRefresh()">🔄 Auto Refresh</button>
+                <button class="btn" onclick="clearLogs()">🗑️ Clear Display</button>
+                <button class="btn" onclick="refreshLogs()">↻ Refresh Now</button>
+                
+                <select id="levelFilter" onchange="applyFilters()">
+                    <option value="">All Levels</option>
+                    <option value="ERROR">Errors Only</option>
+                    <option value="WARNING">Warnings</option>
+                    <option value="SUCCESS">Success</option>
+                    <option value="INFO">Info</option>
+                </select>
+                
+                <select id="categoryFilter" onchange="applyFilters()">
+                    <option value="">All Categories</option>
+                    <option value="MODEL">Model</option>
+                    <option value="INFERENCE">Inference</option>
+                    <option value="FRAMES">Frame Processing</option>
+                    <option value="ANALYSIS">Analysis</option>
+                    <option value="DETECTION">Detections</option>
+                    <option value="DOWNLOAD">Downloads</option>
+                    <option value="WORKER">Worker</option>
+                    <option value="SYSTEM">System</option>
+                </select>
+                
+                <input type="text" id="jobFilter" placeholder="Filter by Job ID" oninput="applyFilters()" />
+                <input type="text" id="searchFilter" placeholder="Search message..." oninput="applyFilters()" />
+                
+                <span style="margin-left: auto; color: #888; font-size: 12px;">
+                    Last Updated: <span id="lastUpdate">Never</span>
+                </span>
+            </div>
+            
+            <div class="log-container" id="logContainer">
+                <div style="text-align: center; color: #888; padding: 50px;">
+                    Loading logs...
+                </div>
+            </div>
+        </div>
         
-        # Check if file is selected
-        if file.filename == '':
-            return jsonify({
-                'success': False,
-                'error': 'No file selected'
-            }), 400
+        <button class="auto-scroll" id="scrollBtn" onclick="scrollToBottom()" title="Scroll to bottom">⬇️</button>
         
-        # Check file extension
-        if not allowed_file(file.filename):
-            return jsonify({
-                'success': False,
-                'error': f'Invalid file format. Allowed: {ALLOWED_EXTENSIONS}'
-            }), 400
+        <script>
+            let autoRefreshEnabled = true;
+            let refreshInterval;
+            let allLogs = [];
+            let filteredLogs = [];
+            
+            function toggleAutoRefresh() {
+                autoRefreshEnabled = !autoRefreshEnabled;
+                const btn = document.getElementById('autoRefresh');
+                
+                if (autoRefreshEnabled) {
+                    btn.textContent = '🔄 Auto Refresh';
+                    btn.classList.add('active');
+                    startAutoRefresh();
+                } else {
+                    btn.textContent = '⏸️ Paused';
+                    btn.classList.remove('active');
+                    stopAutoRefresh();
+                }
+            }
+            
+            function startAutoRefresh() {
+                if (refreshInterval) clearInterval(refreshInterval);
+                refreshInterval = setInterval(refreshLogs, 2000);
+                refreshLogs(); // Initial load
+            }
+            
+            function stopAutoRefresh() {
+                if (refreshInterval) {
+                    clearInterval(refreshInterval);
+                    refreshInterval = null;
+                }
+            }
+            
+            async function refreshLogs() {
+                try {
+                    const response = await fetch('/api/logs');
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        allLogs = data.logs;
+                        updateStats(data.stats);
+                        updateModelInfo(data.model_info);
+                        applyFilters();
+                        
+                        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                    }
+                } catch (error) {
+                    console.error('Error fetching logs:', error);
+                }
+            }
+            
+            function updateStats(stats) {
+                document.getElementById('totalLogs').textContent = stats.total_logs;
+                document.getElementById('activeJobs').textContent = stats.active_jobs;
+                document.getElementById('errorCount').textContent = stats.error_count;
+                document.getElementById('detectionCount').textContent = stats.detection_count;
+            }
+            
+            function updateModelInfo(modelInfo) {
+                let html = '';
+                if (modelInfo.model_loaded) {
+                    html = `
+                        <strong>Status:</strong> ✅ Loaded<br>
+                        <strong>Source:</strong> ${modelInfo.source || 'Unknown'}<br>
+                        <strong>Input Shape:</strong> ${modelInfo.input_shape || 'Unknown'}<br>
+                        <strong>Output Shape:</strong> ${modelInfo.output_shape || 'Unknown'}<br>
+                        <strong>Parameters:</strong> ${(modelInfo.parameters || 0).toLocaleString()}<br>
+                        <strong>Output Units:</strong> ${modelInfo.output_units || 'Unknown'}
+                    `;
+                } else {
+                    html = '<strong>Status:</strong> ❌ No model loaded';
+                }
+                document.getElementById('modelInfo').innerHTML = html;
+            }
+            
+            function applyFilters() {
+                const levelFilter = document.getElementById('levelFilter').value;
+                const categoryFilter = document.getElementById('categoryFilter').value;
+                const jobFilter = document.getElementById('jobFilter').value.toLowerCase();
+                const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
+                
+                filteredLogs = allLogs.filter(log => {
+                    if (levelFilter && log.level !== levelFilter) return false;
+                    if (categoryFilter && log.category !== categoryFilter) return false;
+                    if (jobFilter && (!log.job_id || !log.job_id.toLowerCase().includes(jobFilter))) return false;
+                    if (searchFilter && !log.message.toLowerCase().includes(searchFilter)) return false;
+                    return true;
+                });
+                
+                displayLogs();
+            }
+            
+            function displayLogs() {
+                const container = document.getElementById('logContainer');
+                const shouldScrollToBottom = isScrolledToBottom();
+                
+                if (filteredLogs.length === 0) {
+                    container.innerHTML = '<div style="text-align: center; color: #888; padding: 50px;">No logs match current filters</div>';
+                    return;
+                }
+                
+                let html = '';
+                filteredLogs.slice(-1000).forEach(log => { // Show last 1000 logs
+                    const timestamp = new Date(log.timestamp).toLocaleTimeString();
+                    const jobId = log.job_id ? `[${log.job_id.substring(0, 8)}]` : '';
+                    
+                    html += `
+                        <div class="log-entry ${log.level} ${log.category}">
+                            <span class="timestamp">${timestamp}</span>
+                            <span class="level">${log.level}</span>
+                            <span class="category">${log.category}</span>
+                            ${jobId ? `<span class="job-id">${jobId}</span>` : ''}
+                            <span class="message">${escapeHtml(log.message)}</span>
+                        </div>
+                    `;
+                });
+                
+                container.innerHTML = html;
+                
+                if (shouldScrollToBottom) {
+                    scrollToBottom();
+                }
+            }
+            
+            function isScrolledToBottom() {
+                const container = document.getElementById('logContainer');
+                return container.scrollTop + container.clientHeight >= container.scrollHeight - 10;
+            }
+            
+            function scrollToBottom() {
+                const container = document.getElementById('logContainer');
+                container.scrollTop = container.scrollHeight;
+            }
+            
+            function clearLogs() {
+                document.getElementById('logContainer').innerHTML = '<div style="text-align: center; color: #888; padding: 50px;">Logs cleared (refresh to reload)</div>';
+            }
+            
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+            
+            // Start auto-refresh on page load
+            startAutoRefresh();
+            
+            // Update scroll button visibility
+            document.getElementById('logContainer').addEventListener('scroll', function() {
+                const scrollBtn = document.getElementById('scrollBtn');
+                if (isScrolledToBottom()) {
+                    scrollBtn.style.opacity = '0.3';
+                } else {
+                    scrollBtn.style.opacity = '1';
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+
+@app.route('/api/logs')
+def api_logs():
+    """API endpoint to get logs with statistics"""
+    try:
+        # Get recent logs
+        logs_list = list(detailed_logs)
         
-        # Generate job ID
-        job_id = str(uuid.uuid4())
+        # Calculate statistics
+        total_logs = len(logs_list)
+        error_count = len([log for log in logs_list if log['level'] == 'ERROR'])
+        detection_count = len([log for log in logs_list if log['category'] == 'DETECTION'])
+        active_jobs_count = len([job for job in active_jobs.values() if job.get('status') == 'processing'])
         
-        # Save uploaded file
-        filename = secure_filename(file.filename)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        unique_filename = f"{timestamp}_{job_id[:8]}_{filename}"
-        video_path = os.path.join(UPLOAD_FOLDER, unique_filename)
-        
-        file.save(video_path)
-        
-        # Create job record
-        active_jobs[job_id] = {
-            'job_id': job_id,
-            'filename': filename,
-            'video_path': video_path,
-            'status': 'queued',
-            'progress': 0,
-            'created_at': datetime.now().isoformat(),
-            'file_size': os.path.getsize(video_path),
-            'analysis_method': 'run_inference'
-        }
-        
-        # Add to inference queue
-        inference_queue.put({
-            'job_id': job_id,
-            'video_path': video_path
-        })
-        
-        log_message("INFO", f"Video uploaded and queued for analysis: {filename}", job_id)
+        # Get current model info
+        model_info = {
+            'model_loaded': model is not None,
+            'source': model_url or 'local/dummy',
+            'input_shape': str(model.input_shape) if model else None,
+            'output_shape': str(model.output_shape) if model else None,
+            'parameters': model.count_params() if model else None,
+            'output_units': model.output_shape[-1] if model else None
+        };
         
         return jsonify({
             'success': True,
-            'job_id': job_id,
-            'message': 'Video uploaded successfully and queued for analysis',
-            'filename': filename,
-            'analysis_method': 'run_inference',
-            'queue_position': inference_queue.qsize()
+            'logs': logs_list,
+            'stats': {
+                'total_logs': total_logs,
+                'error_count': error_count,
+                'detection_count': detection_count,
+                'active_jobs': active_jobs_count
+            },
+            'model_info': model_info
         })
         
     except Exception as e:
@@ -800,7 +1073,7 @@ def job_status(job_id):
     
     job_info = active_jobs[job_id].copy()
     
-    # Add queue information
+
     job_info['queue_size'] = inference_queue.qsize()
     
     return jsonify({
@@ -914,45 +1187,215 @@ def active_jobs_list():
     
     return jsonify({
         'success': True,
-        'queue_size': inference_queue.qsize(),
-        'total_jobs': len(active_jobs),
         'jobs': jobs_summary
     })
 
-# Flask Routes - Model Management
+# Add these routes after the existing imports and before the main block
+
+# Health check endpoint
+@app.route('/')
+@app.route('/health')
+def health_check():
+    """Health check endpoint"""
+    try:
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'model_loaded': model is not None,
+            'model_info': get_model_basic_info(),
+            'active_jobs': len(active_jobs),
+            'queue_size': inference_queue.qsize()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+# Upload model endpoint
+@app.route('/upload_model', methods=['POST'])
+def upload_model():
+    """Upload a model file"""
+    try:
+        if 'model' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No model file provided'
+            }), 400
+        
+        file = request.files['model']
+        if file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'No file selected'
+            }), 400
+        
+        # Save uploaded model
+        filename = secure_filename(file.filename)
+        model_path = os.path.join(MODEL_CACHE_DIR, filename)
+        file.save(model_path)
+        
+        # Load the uploaded model
+        success = model_manager.load_model_from_file(model_path)
+        
+        if success:
+            global model
+            model = model_manager.get_current_model()
+            return jsonify({
+                'success': True,
+                'message': 'Model uploaded and loaded successfully',
+                'model_path': model_path,
+                'model_info': get_model_basic_info()
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to load uploaded model'
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# Load model from URL endpoint
 @app.route('/load_model', methods=['POST'])
-def load_model_endpoint():
+def load_model():
     """Load model from GitHub URL"""
     try:
         data = request.get_json()
-        
-        if not data or 'github_url' not in data:
+        if not data or 'url' not in data:
             return jsonify({
                 'success': False,
-                'error': 'GitHub URL is required'
+                'error': 'No URL provided'
             }), 400
         
-        github_url = data['github_url']
+        github_url = data['url']
         force_download = data.get('force_download', False)
         
-        # Validate URL
-        if 'github.com' not in github_url:
+        # Load model using model manager
+        success = model_manager.load_model_from_url(github_url, force_download)
+        
+        if success:
+            global model
+            model = model_manager.get_current_model()
+            return jsonify({
+                'success': True,
+                'message': 'Model loaded successfully',
+                'model_info': get_model_basic_info(),
+                'url': github_url
+            })
+        else:
             return jsonify({
                 'success': False,
-                'error': 'Invalid GitHub URL'
+                'error': 'Failed to load model from URL'
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# Get current model status
+@app.route('/get_current_model_status')
+def get_current_model_status():
+    """Get current model status and information"""
+    try:
+        if model is None:
+            return jsonify({
+                'model_loaded': False,
+                'error': 'No model loaded'
+            })
+        
+        model_info = get_model_detailed_info();
+        return jsonify({
+            'model_loaded': True,
+            'model_info': model_info,
+            'download_status': model_download_status,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'model_loaded': False,
+            'error': str(e)
+        }), 500
+
+# Upload and analyze video endpoint
+@app.route('/upload_and_analyze', methods=['POST'])
+def upload_and_analyze():
+    """Upload video and start analysis"""
+    try:
+        # Check if model is loaded
+        if model is None:
+            return jsonify({
+                'success': False,
+                'error': 'No model loaded. Please load a model first.'
             }), 400
         
-        # Start model loading in background thread
-        def load_model_background():
-            load_model_from_url(github_url, force_download)
+        # Check if file is in request
+        if 'video' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No video file provided'
+            }), 400
         
-        thread = threading.Thread(target=load_model_background)
-        thread.start()
+        file = request.files['video']
+        
+        # Check if file is selected
+        if file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'No file selected'
+            }), 400
+        
+        # Check file extension
+        if not allowed_file(file.filename):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid file format. Allowed: {ALLOWED_EXTENSIONS}'
+            }), 400
+        
+        # Generate job ID
+        job_id = str(uuid.uuid4())
+        
+        # Save uploaded file
+        filename = secure_filename(file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        unique_filename = f"{timestamp}_{job_id[:8]}_{filename}"
+        video_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        
+        file.save(video_path);
+        
+        # Create job record
+        active_jobs[job_id] = {
+            'job_id': job_id,
+            'filename': filename,
+            'video_path': video_path,
+            'status': 'queued',
+            'progress': 0,
+            'created_at': datetime.now().isoformat(),
+            'file_size': os.path.getsize(video_path),
+            'current_stage': 'Queued'
+        }
+        
+        # Add to inference queue
+        inference_queue.put({
+            'job_id': job_id,
+            'video_path': video_path
+        })
+        
+        log_message("INFO", f"Video uploaded and queued for analysis: {filename}", job_id)
         
         return jsonify({
             'success': True,
-            'message': 'Model loading started',
-            'github_url': github_url
+            'job_id': job_id,
+            'message': 'Video uploaded successfully and queued for analysis',
+            'filename': filename,
+            'queue_position': inference_queue.qsize()
         })
         
     except Exception as e:
@@ -961,403 +1404,42 @@ def load_model_endpoint():
             'error': str(e)
         }), 500
 
-@app.route('/model_status')
-def model_status():
-    """Get current model status"""
-    global model, model_download_status, model_url
-    
-    status = {
-        'model_loaded': model is not None,
-        'model_url': model_url,
-        'download_status': model_download_status
-    }
-    
-    if model is not None:
-        try:
-            status['model_info'] = {
-                'input_shape': str(model.input_shape),
-                'output_shape': str(model.output_shape),
-                'parameters': model.count_params(),
-                'output_units': model.output_shape[-1]  # Important for your inference function
-            }
-        except:
-            status['model_info'] = 'Info not available'
-    
-    return jsonify(status)
-
-@app.route('/health')
-def health_check():
-    """Enhanced health check"""
-    health_info = {
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'model_loaded': model is not None,
-        'queue_size': inference_queue.qsize(),
-        'active_jobs': len([job for job in active_jobs.values() if job.get('status') == 'processing']),
-        'total_logs': len(system_logs),
-        'directories': {},
-        'dependencies': {},
-        'system_info': {}
-    }
-    
-    # Check directories
-    for name, path in [('upload', UPLOAD_FOLDER), ('results', RESULTS_FOLDER), ('models', MODEL_CACHE_DIR), ('frames', FRAMES_FOLDER)]:
-        health_info['directories'][name] = {
-            'path': path,
-            'exists': os.path.exists(path),
-            'writable': os.access(path, os.W_OK) if os.path.exists(path) else False
-        }
-    
-    return jsonify(health_info)
-
-@app.route('/')
-def home():
-    """Enhanced home page showing run_inference method"""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>🔥 Wildfire Detection System (Frame Inference)</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 1200px; margin: 0 auto; }
-            .card { border: 1px solid #ddd; padding: 20px; margin: 20px 0; border-radius: 5px; }
-            .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
-            .btn:hover { background: #0056b3; }
-            .btn-danger { background: #dc3545; }
-            .btn-danger:hover { background: #c82333; }
-            input[type="url"], input[type="file"] { width: 100%; padding: 8px; margin: 5px 0; }
-            .status { margin: 10px 0; padding: 10px; border-radius: 3px; }
-            .success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
-            .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
-            .info { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
-            .warning { background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; }
-            .progress { background: #f8f9fa; border: 1px solid #dee2e6; height: 20px; border-radius: 3px; }
-            .progress-bar { background: #007bff; height: 100%; border-radius: 3px; transition: width 0.3s; }
-            .job-item { border: 1px solid #ddd; padding: 10px; margin: 5px 0; border-radius: 3px; }
-            .two-column { display: flex; gap: 20px; }
-            .column { flex: 1; }
-            .method-badge { background: #28a745; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🔥 Wildfire Detection System <span class="method-badge">Frame Extraction + Inference</span></h1>
-            
-            <div class="card">
-                <h3>📊 System Status</h3>
-                <p><strong>Status:</strong> <span id="systemStatus">Loading...</span></p>
-                <p><strong>Model Loaded:</strong> <span id="modelLoaded">Checking...</span></p>
-                <p><strong>Model Source:</strong> <span id="modelSource">Unknown</span></p>
-                <p><strong>Output Units:</strong> <span id="outputUnits">Unknown</span></p>
-                <p><strong>Queue Size:</strong> <span id="queueSize">0</span></p>
-                <p><strong>Active Jobs:</strong> <span id="activeJobs">0</span></p>
-            </div>
-            
-            <div class="card">
-                <h3>🔬 Analysis Method</h3>
-                <div class="info status">
-                    <strong>Current Method:</strong> Frame Extraction + run_inference()<br>
-                    <strong>Process:</strong> Video → Frame Extraction → Image Inference → Results<br>
-                    <strong>Benefits:</strong> Uses your original inference function, processes extracted frames as images
-                </div>
-            </div>
-            
-            <div class="two-column">
-                <div class="column">
-                    <div class="card">
-                        <h3>🤖 Model Management</h3>
-                        <div id="modelStatus" class="status info">Loading model status...</div>
-                        
-                        <h4>Load New Model from GitHub</h4>
-                        <input type="url" id="githubUrl" placeholder="https://github.com/user/repo/blob/main/model.h5">
-                        <br>
-                        <label>
-                            <input type="checkbox" id="forceDownload"> Force re-download
-                        </label>
-                        <br><br>
-                        <button onclick="loadModel()" class="btn">📥 Load Model</button>
-                        <button onclick="checkStatus()" class="btn">🔄 Refresh Status</button>
-                    </div>
-                </div>
-                
-                <div class="column">
-                    <div class="card">
-                        <h3>📹 Video Analysis</h3>
-                        <div id="uploadStatus" class="status info">Ready to upload video for frame-based inference</div>
-                        
-                        <h4>Upload Video for Analysis</h4>
-                        <input type="file" id="videoFile" accept=".mp4,.avi,.mov,.mkv,.webm,.flv,.wmv">
-                        <br><br>
-                        <button onclick="uploadVideo()" class="btn">🎬 Upload & Analyze (Frame Method)</button>
-                        <button onclick="refreshJobs()" class="btn">🔄 Refresh Jobs</button>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h3>📋 Analysis Jobs</h3>
-                <div id="jobsList">Loading jobs...</div>
-            </div>
-            
-            <div class="card">
-                <h3>🔗 API Endpoints</h3>
-                <ul>
-                    <li><a href="/health">Health Check</a></li>
-                    <li><a href="/model_status">Model Status (JSON)</a></li>
-                    <li><a href="/active_jobs">Active Jobs (JSON)</a></li>
-                </ul>
-            </div>
-        </div>
+# Get all jobs endpoint
+@app.route('/jobs')
+def get_all_jobs():
+    """Get status of all jobs"""
+    try:
+        return jsonify({
+            'success': True,
+            'jobs': list(active_jobs.values()),
+            'total_jobs': len(active_jobs),
+            'queue_size': inference_queue.qsize(),
+            'timestamp': datetime.now().isoformat()
+        })
         
-        <script>
-            let statusInterval;
-            
-            async function checkStatus() {
-                try {
-                    // Get system health
-                    const healthResponse = await fetch('/health');
-                    const health = await healthResponse.json();
-                    
-                    document.getElementById('systemStatus').textContent = health.status;
-                    document.getElementById('modelLoaded').textContent = health.model_loaded ? 'Yes ✅' : 'No ❌';
-                    document.getElementById('queueSize').textContent = health.queue_size;
-                    document.getElementById('activeJobs').textContent = health.active_jobs;
-                    
-                    // Get model status
-                    const modelResponse = await fetch('/model_status');
-                    const modelStatus = await modelResponse.json();
-                    
-                    document.getElementById('modelSource').textContent = modelStatus.model_url || 'None';
-                    document.getElementById('outputUnits').textContent = modelStatus.model_info?.output_units || 'Unknown';
-                    
-                    let statusHtml = '';
-                    if (modelStatus.download_status && Object.keys(modelStatus.download_status).length > 0) {
-                        const ds = modelStatus.download_status;
-                        statusHtml = `
-                            <strong>Download Status:</strong> ${ds.status}<br>
-                            ${ds.message ? `<strong>Message:</strong> ${ds.message}<br>` : ''}
-                            ${ds.error ? `<strong>Error:</strong> ${ds.error}<br>` : ''}
-                            ${ds.file_size ? `<strong>File Size:</strong> ${(ds.file_size / 1024 / 1024).toFixed(2)} MB<br>` : ''}
-                        `;
-                        
-                        const statusDiv = document.getElementById('modelStatus');
-                        statusDiv.innerHTML = statusHtml;
-                        statusDiv.className = 'status ' + (ds.status === 'completed' ? 'success' : ds.status === 'error' ? 'error' : 'info');
-                    }
-                } catch (error) {
-                    console.error('Error checking status:', error);
-                }
-            }
-            
-            async function loadModel() {
-                const githubUrl = document.getElementById('githubUrl').value;
-                const forceDownload = document.getElementById('forceDownload').checked;
-                
-                if (!githubUrl) {
-                    alert('Please enter a GitHub URL');
-                    return;
-                }
-                
-                try {
-                    const response = await fetch('/load_model', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            github_url: githubUrl,
-                            force_download: forceDownload
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (result.success) {
-                        alert('Model loading started! Status will update automatically.');
-                        startStatusPolling();
-                    } else {
-                        alert('Failed to start model loading: ' + result.error);
-                    }
-                } catch (error) {
-                    alert('Error: ' + error.message);
-                }
-            }
-            
-            async function uploadVideo() {
-                const fileInput = document.getElementById('videoFile');
-                const file = fileInput.files[0];
-                
-                if (!file) {
-                    alert('Please select a video file');
-                    return;
-                }
-                
-                const formData = new FormData();
-                formData.append('video', file);
-                
-                const uploadStatus = document.getElementById('uploadStatus');
-                uploadStatus.innerHTML = 'Uploading video for frame-based analysis...';
-                uploadStatus.className = 'status info';
-                
-                try {
-                    const response = await fetch('/upload_and_analyze', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (result.success) {
-                        uploadStatus.innerHTML = `Video uploaded successfully! Job ID: ${result.job_id}<br>Method: ${result.analysis_method}`;
-                        uploadStatus.className = 'status success';
-                        refreshJobs();
-                        startJobPolling();
-                    } else {
-                        uploadStatus.innerHTML = 'Upload failed: ' + result.error;
-                        uploadStatus.className = 'status error';
-                    }
-                } catch (error) {
-                    uploadStatus.innerHTML = 'Upload error: ' + error.message;
-                    uploadStatus.className = 'status error';
-                }
-            }
-            
-            async function refreshJobs() {
-                try {
-                    const response = await fetch('/active_jobs');
-                    const result = await response.json();
-                    
-                    if (result.success) {
-                        let jobsHtml = '';
-                        
-                        if (result.jobs.length === 0) {
-                            jobsHtml = '<p>No active jobs</p>';
-                        } else {
-                            result.jobs.forEach(job => {
-                                const statusClass = job.status === 'completed' ? 'success' : 
-                                                  job.status === 'failed' ? 'error' : 
-                                                  job.status === 'processing' ? 'warning' : 'info';
-                                
-                                jobsHtml += `
-                                    <div class="job-item ${statusClass}">
-                                        <strong>Job ${job.job_id.substring(0, 8)}</strong> - ${job.filename}<br>
-                                        <span class="method-badge">${job.analysis_method}</span><br>
-                                        Status: ${job.status} | Progress: ${job.progress}%<br>
-                                        ${job.frames_extracted ? `Frames Extracted: ${job.frames_extracted} | ` : ''}
-                                        ${job.frames_analyzed ? `Frames Analyzed: ${job.frames_analyzed}` : ''}
-                                        ${job.status === 'processing' ? `
-                                            <div class="progress">
-                                                <div class="progress-bar" style="width: ${job.progress}%"></div>
-                                            </div>
-                                        ` : ''}
-                                        ${job.status === 'completed' ? `
-                                            <br><strong>Wildfire Detected:</strong> ${job.wildfire_detected ? 'Yes ⚠️' : 'No ✅'} | 
-                                            <strong>Detections:</strong> ${job.total_detections || 0}<br>
-                                            <button onclick="downloadResults('${job.job_id}')" class="btn">📄 Download JSON</button>
-                                            <button onclick="downloadCSV('${job.job_id}')" class="btn">📊 Download CSV</button>
-                                            <button onclick="viewResults('${job.job_id}')" class="btn">👁️ View Results</button>
-                                        ` : ''}
-                                    </div>
-                                `;
-                            });
-                        }
-                        
-                        document.getElementById('jobsList').innerHTML = jobsHtml;
-                    }
-                } catch (error) {
-                    console.error('Error refreshing jobs:', error);
-                }
-            }
-            
-            async function downloadResults(jobId) {
-                window.open(`/download_results/${jobId}`, '_blank');
-            }
-            
-            async function downloadCSV(jobId) {
-                window.open(`/download_csv/${jobId}`, '_blank');
-            }
-            
-            async function viewResults(jobId) {
-                try {
-                    const response = await fetch(`/job_results/${jobId}`);
-                    const result = await response.json();
-                    
-                    if (result.success) {
-                        const resultsWindow = window.open('', '_blank');
-                        resultsWindow.document.write(`
-                            <html>
-                                <head><title>Frame-based Analysis Results - ${jobId}</title></head>
-                                <body>
-                                    <h1>Wildfire Detection Results (Frame Inference)</h1>
-                                    <h2>Summary</h2>
-                                    <p><strong>Method:</strong> ${result.results.analysis_method}</p>
-                                    <p><strong>Frames Analyzed:</strong> ${result.results.total_frames_analyzed}</p>
-                                    <p><strong>Wildfire Detected:</strong> ${result.results.summary.wildfire_detected ? 'Yes' : 'No'}</p>
-                                    <p><strong>Total Detections:</strong> ${result.results.summary.total_detections}</p>
-                                    <p><strong>Risk Percentage:</strong> ${result.results.summary.risk_percentage.toFixed(2)}%</p>
-                                    
-                                    <h2>Full Results</h2>
-                                    <pre>${JSON.stringify(result.results, null, 2)}</pre>
-                                </body>
-                            </html>
-                        `);
-                    } else {
-                        alert('Failed to get results: ' + result.error);
-                    }
-                } catch (error) {
-                    alert('Error: ' + error.message);
-                }
-            }
-            
-            function startStatusPolling() {
-                if (statusInterval) clearInterval(statusInterval);
-                statusInterval = setInterval(checkStatus, 2000);
-            }
-            
-            function startJobPolling() {
-                const jobInterval = setInterval(async () => {
-                    await refreshJobs();
-                    
-                    // Check if all jobs are completed
-                    const response = await fetch('/active_jobs');
-                    const result = await response.json();
-                    
-                    const hasActiveJobs = result.jobs.some(job => 
-                        job.status === 'processing' || job.status === 'queued'
-                    );
-                    
-                    if (!hasActiveJobs) {
-                        clearInterval(jobInterval);
-                    }
-                }, 3000);
-            }
-            
-            // Load initial status and jobs
-            checkStatus();
-            refreshJobs();
-        </script>
-    </body>
-    </html>
-    """
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
+# Main execution block
 if __name__ == '__main__':
-    print("🔧 Starting Flask application...")
-    
-    # Load initial model
-    if load_initial_model():
-        log_message("SUCCESS", "Initial model loaded successfully")
-    else:
-        log_message("ERROR", "Failed to load initial model")
-        sys.exit(1)
-    
-    # Start inference worker thread
+    # Start the inference worker in a separate thread
     worker_thread = threading.Thread(target=inference_worker, daemon=True)
     worker_thread.start()
     
-    log_message("INFO", "🔥 Wildfire Detection Server Starting with Frame Inference Method...")
-    log_message("INFO", f"📹 Server will be available at: http://0.0.0.0:5000")
-    
+    # Load initial model
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False)
+        model_manager.load_initial_model()
+        model = model_manager.get_current_model()
+        if model:
+            log_message("SUCCESS", "Initial model loaded successfully")
+        else:
+            log_message("INFO", "No initial model found, will load when requested")
     except Exception as e:
-        log_message("ERROR", f"Failed to start Flask app: {e}")
-        sys.exit(1)
+        log_message("ERROR", f"Failed to load initial model: {e}")
+    
+    # Start Flask app
+    log_message("INFO", "Starting Flask application...")
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

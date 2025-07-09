@@ -29,7 +29,31 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 2Gi
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wildfire-videos-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 15Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wildfire-results-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
 
 ---
 apiVersion: apps/v1
@@ -65,10 +89,14 @@ spec:
         - name: TF_CPP_MIN_LOG_LEVEL
           value: "2"
         
-        # Mount the PVC
+        # Mount the PVCs for persistent storage
         volumeMounts:
         - name: models-storage
           mountPath: /app/models
+        - name: videos-storage
+          mountPath: /app/videos
+        - name: results-storage
+          mountPath: /app/results
         
         resources:
           requests:
@@ -107,6 +135,12 @@ spec:
       - name: models-storage
         persistentVolumeClaim:
           claimName: wildfire-models-pvc
+      - name: videos-storage
+        persistentVolumeClaim:
+          claimName: wildfire-videos-pvc
+      - name: results-storage
+        persistentVolumeClaim:
+          claimName: wildfire-results-pvc
 
 ---
 apiVersion: v1
