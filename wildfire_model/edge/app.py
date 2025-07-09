@@ -1,5 +1,6 @@
 import os
 import sys
+import pandas as pd
 
 # Add current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,8 +54,15 @@ import threading
 from queue import Queue
 from collections import deque
 import time
+import logging
+from PIL import Image
+import glob
 
 print("✅ All imports successful")
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -62,14 +70,17 @@ app = Flask(__name__)
 UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', './videos')
 RESULTS_FOLDER = os.getenv('RESULTS_FOLDER', './results')
 MODEL_CACHE_DIR = os.getenv('MODEL_CACHE_DIR', './models')
+FRAMES_FOLDER = os.getenv('FRAMES_FOLDER', './frames')  # New folder for extracted frames
 MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', 100 * 1024 * 1024))
 GITHUB_DOWNLOAD_TIMEOUT = int(os.getenv('GITHUB_DOWNLOAD_TIMEOUT', 300))
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv', 'wmv'}
+IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'bmp', 'tiff', 'tif'}
 
 print(f"📁 Configuration:")
 print(f"  - Upload folder: {UPLOAD_FOLDER}")
 print(f"  - Results folder: {RESULTS_FOLDER}")
 print(f"  - Model cache: {MODEL_CACHE_DIR}")
+print(f"  - Frames folder: {FRAMES_FOLDER}")
 print(f"  - Max file size: {MAX_FILE_SIZE / 1024 / 1024:.1f}MB")
 
 # Create directories
@@ -77,6 +88,7 @@ try:
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(RESULTS_FOLDER, exist_ok=True)
     os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+    os.makedirs(FRAMES_FOLDER, exist_ok=True)
     print("✅ Directories created successfully")
 except Exception as e:
     print(f"❌ Error creating directories: {e}")
@@ -105,33 +117,163 @@ def log_message(level, message, job_id=None):
     }
     system_logs.append(log_entry)
     print(f"[{level}] {message}")
+    
+    # Also log to logger
+    if level == "ERROR":
+        logger.error(message)
+    elif level == "WARNING":
+        logger.warning(message)
+    else:
+        logger.info(message)
 
 def allowed_file(filename):
     """Check if uploaded file has allowed extension"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def preprocess_frame(frame, target_size=(224, 224)):
-    """Preprocess frame for model input"""
+def get_image_files(test_dir: str, exclude_bases=None):
+    """Get all image files from directory, excluding specified base names"""
+    if exclude_bases is None:
+        exclude_bases = set()
+    
+    image_files = []
+    for ext in IMAGE_EXTENSIONS:
+        pattern = os.path.join(test_dir, f"*.{ext}")
+        image_files.extend(glob.glob(pattern, recursive=False))
+        # Also check uppercase
+        pattern = os.path.join(test_dir, f"*.{ext.upper()}")
+        image_files.extend(glob.glob(pattern, recursive=False))
+    
+    # Filter out excluded files
+    filtered_files = []
+    for f in image_files:
+        base_name = os.path.splitext(os.path.basename(f))[0]
+        if base_name not in exclude_bases:
+            filtered_files.append(f)
+    
+    logger.info(f"Found {len(filtered_files)} image files in {test_dir}")
+    return sorted(filtered_files)
+
+def preprocess_image(image_path, target_size=(224, 224)):
+    """Preprocess single image for model input"""
     try:
-        # Resize frame
-        resized = cv2.resize(frame, target_size)
+        # Load image using PIL
+        image = Image.open(image_path)
         
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Resize image
+        image = image.resize(target_size)
+        
+        # Convert to numpy array
+        img_array = np.array(image)
         
         # Normalize to [0, 1]
-        normalized = rgb_frame.astype(np.float32) / 255.0
+        img_array = img_array.astype(np.float32) / 255.0
         
         # Add batch dimension
-        batch_frame = np.expand_dims(normalized, axis=0)
+        img_array = np.expand_dims(img_array, axis=0)
         
-        return batch_frame
+        return img_array
+        
     except Exception as e:
-        log_message("ERROR", f"Error preprocessing frame: {e}")
+        logger.error(f"Error preprocessing image {image_path}: {e}")
         return None
 
-def analyze_video(video_path, job_id):
-    """Analyze video for wildfire detection"""
+def run_inference(model, test_dir: str, exclude_bases=None) -> pd.DataFrame:
+    """
+    Your original inference function - run inference on images in a directory
+    """
+    logger.info(f"Running inference on {test_dir} (excluding {len(exclude_bases) if exclude_bases else 0} files)")
+    
+    files = get_image_files(test_dir, exclude_bases=exclude_bases)
+    results = []
+    out_units = model.output_shape[-1]
+    
+    for f in files:
+        try:
+            probs = model.predict(preprocess_image(f), verbose=0).flatten()
+            if out_units == 1:
+                prob = float(probs[0])
+                pred = int(prob > 0.5)
+            else:
+                pred = int(np.argmax(probs))
+                prob = float(probs[pred])
+            
+            results.append({
+                'image': os.path.basename(f), 
+                'pred': pred, 
+                'prob': prob,
+                'image_path': f
+            })
+            
+        except Exception as e:
+            logger.error(f"Error processing image {f}: {e}")
+            # Add failed result
+            results.append({
+                'image': os.path.basename(f), 
+                'pred': -1, 
+                'prob': 0.0,
+                'image_path': f,
+                'error': str(e)
+            })
+    
+    df = pd.DataFrame(results)
+    logger.info(f"Completed inference: {len(df)} samples")
+    return df
+
+def extract_frames_from_video(video_path, output_dir, frame_interval=30):
+    """Extract frames from video for inference"""
+    try:
+        # Create output directory for this video
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        video_frames_dir = os.path.join(output_dir, video_name)
+        os.makedirs(video_frames_dir, exist_ok=True)
+        
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception(f"Cannot open video file: {video_path}")
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        logger.info(f"Extracting frames from {video_path}: {total_frames} total frames, {fps} FPS")
+        
+        frame_count = 0
+        saved_frames = 0
+        extracted_files = []
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Save every nth frame
+            if frame_count % frame_interval == 0:
+                timestamp = frame_count / fps
+                frame_filename = f"frame_{frame_count:06d}_t{timestamp:.2f}s.jpg"
+                frame_path = os.path.join(video_frames_dir, frame_filename)
+                
+                # Save frame
+                cv2.imwrite(frame_path, frame)
+                extracted_files.append(frame_path)
+                saved_frames += 1
+            
+            frame_count += 1
+        
+        cap.release();
+        
+        logger.info(f"Extracted {saved_frames} frames to {video_frames_dir}")
+        return video_frames_dir, extracted_files
+        
+    except Exception as e:
+        logger.error(f"Error extracting frames from {video_path}: {e}")
+        raise
+
+def analyze_video_with_inference(video_path, job_id):
+    """Analyze video using your run_inference function"""
     global model
     
     try:
@@ -142,125 +284,52 @@ def analyze_video(video_path, job_id):
         
         # Update job status
         active_jobs[job_id]['status'] = 'processing'
-        active_jobs[job_id]['progress'] = 0
+        active_jobs[job_id]['progress'] = 10
         
-        # Open video
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise Exception(f"Cannot open video file: {video_path}")
+        # Extract frames from video
+        log_message("INFO", "Extracting frames from video...", job_id)
+        frames_dir, extracted_files = extract_frames_from_video(
+            video_path, 
+            FRAMES_FOLDER, 
+            frame_interval=30  # Extract every 30th frame
+        )
         
-        # Get video properties
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        duration = total_frames / fps if fps > 0 else 0
+        active_jobs[job_id]['progress'] = 30
+        active_jobs[job_id]['frames_extracted'] = len(extracted_files)
         
-        log_message("INFO", f"Video info: {total_frames} frames, {fps:.2f} FPS, {duration:.2f}s", job_id)
+        # Run inference on extracted frames using your function
+        log_message("INFO", f"Running inference on {len(extracted_files)} frames...", job_id)
         
-        # Analysis results
-        results = {
-            'job_id': job_id,
-            'video_path': video_path,
-            'total_frames': total_frames,
-            'fps': fps,
-            'duration': duration,
-            'detections': [],
-            'summary': {
-                'wildfire_detected': False,
-                'confidence_scores': [],
-                'detection_timestamps': [],
-                'high_risk_frames': 0
-            }
-        }
+        # Use your original run_inference function
+        inference_results = run_inference(model, frames_dir, exclude_bases=None)
         
-        frame_count = 0
-        detection_threshold = 0.7  # Confidence threshold for wildfire detection
+        active_jobs[job_id]['progress'] = 80
         
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            frame_count += 1
-            
-            # Update progress
-            progress = (frame_count / total_frames) * 100
-            active_jobs[job_id]['progress'] = progress
-            
-            # Process every 30th frame (to speed up analysis)
-            if frame_count % 30 == 0:
-                timestamp = frame_count / fps
-                
-                # Preprocess frame
-                processed_frame = preprocess_frame(frame)
-                if processed_frame is None:
-                    continue
-                
-                # Run inference
-                try:
-                    predictions = model.predict(processed_frame, verbose=0)
-                    
-                    # Assuming binary classification: [no_fire, fire]
-                    if len(predictions[0]) >= 2:
-                        fire_confidence = float(predictions[0][1])
-                        no_fire_confidence = float(predictions[0][0])
-                    else:
-                        fire_confidence = float(predictions[0][0])
-                        no_fire_confidence = 1.0 - fire_confidence
-                    
-                    results['summary']['confidence_scores'].append(fire_confidence)
-                    
-                    # Check if wildfire detected
-                    if fire_confidence > detection_threshold:
-                        results['summary']['wildfire_detected'] = True
-                        results['summary']['detection_timestamps'].append(timestamp)
-                        results['summary']['high_risk_frames'] += 1
-                        
-                        detection = {
-                            'frame_number': frame_count,
-                            'timestamp': timestamp,
-                            'fire_confidence': fire_confidence,
-                            'no_fire_confidence': no_fire_confidence,
-                            'alert_level': 'HIGH' if fire_confidence > 0.9 else 'MEDIUM'
-                        }
-                        results['detections'].append(detection)
-                        
-                        log_message("WARNING", f"Wildfire detected at {timestamp:.2f}s (confidence: {fire_confidence:.3f})", job_id)
-                
-                except Exception as e:
-                    log_message("ERROR", f"Error during inference at frame {frame_count}: {e}", job_id)
-                    continue
-            
-            # Log progress every 10%
-            if frame_count % (total_frames // 10) == 0:
-                log_message("INFO", f"Analysis progress: {progress:.1f}%", job_id)
-        
-        cap.release()
-        
-        # Calculate final statistics
-        if results['summary']['confidence_scores']:
-            avg_confidence = np.mean(results['summary']['confidence_scores'])
-            max_confidence = np.max(results['summary']['confidence_scores'])
-            results['summary']['average_confidence'] = float(avg_confidence)
-            results['summary']['max_confidence'] = float(max_confidence)
-            results['summary']['total_detections'] = len(results['detections'])
-            results['summary']['risk_percentage'] = (results['summary']['high_risk_frames'] / (total_frames // 30)) * 100
+        # Process results
+        video_results = process_inference_results(inference_results, video_path, job_id)
         
         # Save results
         results_filename = f"analysis_{job_id}.json"
         results_path = os.path.join(RESULTS_FOLDER, results_filename)
         
         with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(video_results, f, indent=2)
+        
+        # Also save DataFrame as CSV
+        csv_path = os.path.join(RESULTS_FOLDER, f"inference_{job_id}.csv")
+        inference_results.to_csv(csv_path, index=False)
         
         # Update job status
         active_jobs[job_id]['status'] = 'completed'
         active_jobs[job_id]['progress'] = 100
-        active_jobs[job_id]['results'] = results
+        active_jobs[job_id]['results'] = video_results
         active_jobs[job_id]['results_file'] = results_path
+        active_jobs[job_id]['csv_file'] = csv_path
+        active_jobs[job_id]['frames_dir'] = frames_dir
         
         log_message("SUCCESS", f"Video analysis completed. Results saved to: {results_path}", job_id)
         
-        return results
+        return video_results
         
     except Exception as e:
         error_msg = f"Video analysis failed: {str(e)}"
@@ -271,6 +340,80 @@ def analyze_video(video_path, job_id):
         active_jobs[job_id]['error'] = error_msg
         
         return None
+
+def process_inference_results(df: pd.DataFrame, video_path: str, job_id: str):
+    """Process the inference DataFrame into video analysis results"""
+    
+    # Get video info
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 30
+    duration = total_frames / fps if fps > 0 else 0
+    cap.release()
+    
+    # Analyze results
+    wildfire_detections = df[df['pred'] == 1] if 'pred' in df.columns else pd.DataFrame()
+    detection_threshold = 0.5  # Can be adjusted
+    
+    # Extract timestamps from frame names
+    detections_list = []
+    for _, row in wildfire_detections.iterrows():
+        try:
+            # Extract timestamp from filename like "frame_000030_t1.00s.jpg"
+            filename = row['image']
+            if '_t' in filename and 's.jpg' in filename:
+                timestamp_str = filename.split('_t')[1].split('s.jpg')[0]
+                timestamp = float(timestamp_str)
+            else:
+                # Fallback: estimate from frame number
+                frame_num = int(filename.split('_')[1]) if '_' in filename else 0
+                timestamp = frame_num / fps
+            
+            detection = {
+                'frame_file': filename,
+                'timestamp': timestamp,
+                'fire_confidence': float(row['prob']),
+                'prediction': int(row['pred']),
+                'alert_level': 'HIGH' if row['prob'] > 0.8 else 'MEDIUM',
+                'image_path': row.get('image_path', '')
+            }
+            detections_list.append(detection)
+            
+        except Exception as e:
+            logger.error(f"Error processing detection row: {e}")
+    
+    # Calculate summary statistics
+    confidence_scores = df['prob'].tolist() if 'prob' in df.columns else []
+    
+    results = {
+        'job_id': job_id,
+        'video_path': video_path,
+        'analysis_method': 'frame_extraction_inference',
+        'total_frames_analyzed': len(df),
+        'original_video_frames': total_frames,
+        'fps': fps,
+        'duration': duration,
+        'model_info': {
+            'output_units': model.output_shape[-1] if model else 'unknown',
+            'input_shape': str(model.input_shape) if model else 'unknown'
+        },
+        'detections': detections_list,
+        'summary': {
+            'wildfire_detected': len(wildfire_detections) > 0,
+            'total_detections': len(wildfire_detections),
+            'confidence_scores': confidence_scores,
+            'detection_timestamps': [d['timestamp'] for d in detections_list],
+            'high_risk_frames': len([d for d in detections_list if d['fire_confidence'] > 0.8]),
+            'average_confidence': float(np.mean(confidence_scores)) if confidence_scores else 0.0,
+            'max_confidence': float(np.max(confidence_scores)) if confidence_scores else 0.0,
+            'risk_percentage': (len(wildfire_detections) / len(df)) * 100 if len(df) > 0 else 0.0
+        },
+        'inference_dataframe': df.to_dict('records')  # Include full DataFrame data
+    }
+    
+    log_message("INFO", f"Processed results: {len(wildfire_detections)} detections out of {len(df)} frames", job_id)
+    
+    return results
 
 def inference_worker():
     """Background worker for processing inference queue"""
@@ -285,8 +428,8 @@ def inference_worker():
                 
                 log_message("INFO", f"Processing job {job_id}", job_id)
                 
-                # Analyze video
-                results = analyze_video(video_path, job_id)
+                # Analyze video using your inference method
+                results = analyze_video_with_inference(video_path, job_id)
                 
                 inference_queue.task_done()
             else:
@@ -296,17 +439,11 @@ def inference_worker():
             log_message("ERROR", f"Inference worker error: {e}")
             time.sleep(5)
 
+# [Include all your model loading functions from before - download_model_from_github, validate_model_file, etc.]
+# ... (keeping the same model loading functions as before)
+
 def download_model_from_github(url, destination_path):
-    """
-    Download model from GitHub URL (integrated from test_github_url.py)
-    
-    Args:
-        url (str): GitHub URL (blob or raw)
-        destination_path (str): Local path to save the model
-    
-    Returns:
-        dict: Download result with success status and details
-    """
+    """Download model from GitHub URL (same as before)"""
     try:
         log_message("INFO", f"Starting download from: {url}")
         
@@ -378,15 +515,7 @@ def download_model_from_github(url, destination_path):
         }
 
 def validate_model_file(filepath):
-    """
-    Validate that the downloaded file is a valid model
-    
-    Args:
-        filepath (str): Path to the model file
-    
-    Returns:
-        dict: Validation result
-    """
+    """Validate downloaded model file (same as before)"""
     try:
         if not os.path.exists(filepath):
             return {
@@ -461,7 +590,7 @@ def validate_model_file(filepath):
         }
 
 def load_model_from_url(github_url, force_download=False):
-    """Load model from GitHub URL"""
+    """Load model from GitHub URL (same as before)"""
     global model, model_url, model_download_status
     
     model_url = github_url
@@ -582,7 +711,7 @@ def load_initial_model():
 # Flask Routes - Video Analysis
 @app.route('/upload_and_analyze', methods=['POST'])
 def upload_and_analyze():
-    """Upload video and start analysis"""
+    """Upload video and start analysis using run_inference method"""
     try:
         # Check if model is loaded
         if model is None:
@@ -633,7 +762,8 @@ def upload_and_analyze():
             'status': 'queued',
             'progress': 0,
             'created_at': datetime.now().isoformat(),
-            'file_size': os.path.getsize(video_path)
+            'file_size': os.path.getsize(video_path),
+            'analysis_method': 'run_inference'
         }
         
         # Add to inference queue
@@ -649,6 +779,7 @@ def upload_and_analyze():
             'job_id': job_id,
             'message': 'Video uploaded successfully and queued for analysis',
             'filename': filename,
+            'analysis_method': 'run_inference',
             'queue_position': inference_queue.qsize()
         })
         
@@ -729,6 +860,29 @@ def download_results(job_id):
         download_name=f"wildfire_analysis_{job_id}.json"
     )
 
+@app.route('/download_csv/<job_id>')
+def download_csv(job_id):
+    """Download inference results as CSV"""
+    if job_id not in active_jobs:
+        return jsonify({
+            'success': False,
+            'error': 'Job not found'
+        }), 404
+    
+    job = active_jobs[job_id]
+    
+    if 'csv_file' not in job or not os.path.exists(job['csv_file']):
+        return jsonify({
+            'success': False,
+            'error': 'CSV file not available'
+        }), 404
+    
+    return send_file(
+        job['csv_file'],
+        as_attachment=True,
+        download_name=f"inference_results_{job_id}.csv"
+    )
+
 @app.route('/active_jobs')
 def active_jobs_list():
     """Get list of all active jobs"""
@@ -740,12 +894,21 @@ def active_jobs_list():
             'filename': job.get('filename', 'Unknown'),
             'status': job.get('status', 'Unknown'),
             'progress': job.get('progress', 0),
-            'created_at': job.get('created_at', 'Unknown')
+            'created_at': job.get('created_at', 'Unknown'),
+            'analysis_method': job.get('analysis_method', 'Unknown'),
+            'frames_extracted': job.get('frames_extracted', 0)
         }
         
         if job.get('status') == 'completed' and 'results' in job:
             summary['wildfire_detected'] = job['results']['summary'].get('wildfire_detected', False)
             summary['total_detections'] = job['results']['summary'].get('total_detections', 0)
+            summary['frames_analyzed'] = job['results'].get('total_frames_analyzed', 0)
+        summary['risk_level'] = 'LOW'
+        if job.get('status') == 'completed' and 'results' in job:
+            if job['results']['summary'].get('wildfire_detected', False):
+                summary['risk_level'] = 'HIGH'
+            elif job['results']['summary'].get('average_confidence', 0) > 0.7:
+                summary['risk_level'] = 'MEDIUM'
         
         jobs_summary.append(summary)
     
@@ -814,56 +977,17 @@ def model_status():
             status['model_info'] = {
                 'input_shape': str(model.input_shape),
                 'output_shape': str(model.output_shape),
-                'parameters': model.count_params()
+                'parameters': model.count_params(),
+                'output_units': model.output_shape[-1]  # Important for your inference function
             }
         except:
             status['model_info'] = 'Info not available'
     
     return jsonify(status)
 
-@app.route('/current_model_info')
-def current_model_info():
-    """Get information about the currently loaded model"""
-    global model, model_url, model_download_status
-    
-    if model is None:
-        return jsonify({
-            'model_loaded': False,
-            'message': 'No model currently loaded'
-        })
-    
-    try:
-        model_info = {
-            'model_loaded': True,
-            'source_url': model_url,
-            'input_shape': str(model.input_shape),
-            'output_shape': str(model.output_shape),
-            'total_parameters': model.count_params(),
-            'layer_count': len(model.layers),
-            'model_summary': []
-        }
-        
-        # Get layer information
-        for i, layer in enumerate(model.layers):
-            layer_info = {
-                'layer_index': i,
-                'layer_name': layer.name,
-                'layer_type': type(layer).__name__,
-                'output_shape': str(layer.output_shape) if hasattr(layer, 'output_shape') else 'N/A'
-            }
-            model_info['model_summary'].append(layer_info)
-        
-        return jsonify(model_info)
-        
-    except Exception as e:
-        return jsonify({
-            'model_loaded': True,
-            'error': f'Error getting model info: {str(e)}'
-        })
-
 @app.route('/health')
 def health_check():
-    """Enhanced health check with diagnostics"""
+    """Enhanced health check"""
     health_info = {
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
@@ -877,45 +1001,26 @@ def health_check():
     }
     
     # Check directories
-    for name, path in [('upload', UPLOAD_FOLDER), ('results', RESULTS_FOLDER), ('models', MODEL_CACHE_DIR)]:
+    for name, path in [('upload', UPLOAD_FOLDER), ('results', RESULTS_FOLDER), ('models', MODEL_CACHE_DIR), ('frames', FRAMES_FOLDER)]:
         health_info['directories'][name] = {
             'path': path,
             'exists': os.path.exists(path),
             'writable': os.access(path, os.W_OK) if os.path.exists(path) else False
         }
     
-    # Check dependencies
-    try:
-        health_info['dependencies']['tensorflow'] = tf.__version__
-    except:
-        health_info['dependencies']['tensorflow'] = 'Not available'
-    
-    try:
-        import cv2
-        health_info['dependencies']['opencv'] = cv2.__version__
-    except:
-        health_info['dependencies']['opencv'] = 'Not available'
-    
-    # System info
-    health_info['system_info'] = {
-        'python_version': sys.version,
-        'working_directory': os.getcwd(),
-        'user_id': os.getuid() if hasattr(os, 'getuid') else 'unknown'
-    }
-    
     return jsonify(health_info)
 
 @app.route('/')
 def home():
-    """Enhanced home page with video upload and model management"""
+    """Enhanced home page showing run_inference method"""
     return """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🔥 Wildfire Detection System</title>
+        <title>🔥 Wildfire Detection System (Frame Inference)</title>
         <style>
             body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 1000px; margin: 0 auto; }
+            .container { max-width: 1200px; margin: 0 auto; }
             .card { border: 1px solid #ddd; padding: 20px; margin: 20px 0; border-radius: 5px; }
             .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
             .btn:hover { background: #0056b3; }
@@ -932,19 +1037,30 @@ def home():
             .job-item { border: 1px solid #ddd; padding: 10px; margin: 5px 0; border-radius: 3px; }
             .two-column { display: flex; gap: 20px; }
             .column { flex: 1; }
+            .method-badge { background: #28a745; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🔥 Wildfire Detection System</h1>
+            <h1>🔥 Wildfire Detection System <span class="method-badge">Frame Extraction + Inference</span></h1>
             
             <div class="card">
                 <h3>📊 System Status</h3>
                 <p><strong>Status:</strong> <span id="systemStatus">Loading...</span></p>
                 <p><strong>Model Loaded:</strong> <span id="modelLoaded">Checking...</span></p>
                 <p><strong>Model Source:</strong> <span id="modelSource">Unknown</span></p>
+                <p><strong>Output Units:</strong> <span id="outputUnits">Unknown</span></p>
                 <p><strong>Queue Size:</strong> <span id="queueSize">0</span></p>
                 <p><strong>Active Jobs:</strong> <span id="activeJobs">0</span></p>
+            </div>
+            
+            <div class="card">
+                <h3>🔬 Analysis Method</h3>
+                <div class="info status">
+                    <strong>Current Method:</strong> Frame Extraction + run_inference()<br>
+                    <strong>Process:</strong> Video → Frame Extraction → Image Inference → Results<br>
+                    <strong>Benefits:</strong> Uses your original inference function, processes extracted frames as images
+                </div>
             </div>
             
             <div class="two-column">
@@ -968,12 +1084,12 @@ def home():
                 <div class="column">
                     <div class="card">
                         <h3>📹 Video Analysis</h3>
-                        <div id="uploadStatus" class="status info">Ready to upload video</div>
+                        <div id="uploadStatus" class="status info">Ready to upload video for frame-based inference</div>
                         
                         <h4>Upload Video for Analysis</h4>
                         <input type="file" id="videoFile" accept=".mp4,.avi,.mov,.mkv,.webm,.flv,.wmv">
                         <br><br>
-                        <button onclick="uploadVideo()" class="btn">🎬 Upload & Analyze</button>
+                        <button onclick="uploadVideo()" class="btn">🎬 Upload & Analyze (Frame Method)</button>
                         <button onclick="refreshJobs()" class="btn">🔄 Refresh Jobs</button>
                     </div>
                 </div>
@@ -989,7 +1105,6 @@ def home():
                 <ul>
                     <li><a href="/health">Health Check</a></li>
                     <li><a href="/model_status">Model Status (JSON)</a></li>
-                    <li><a href="/current_model_info">Detailed Model Info (JSON)</a></li>
                     <li><a href="/active_jobs">Active Jobs (JSON)</a></li>
                 </ul>
             </div>
@@ -1014,6 +1129,7 @@ def home():
                     const modelStatus = await modelResponse.json();
                     
                     document.getElementById('modelSource').textContent = modelStatus.model_url || 'None';
+                    document.getElementById('outputUnits').textContent = modelStatus.model_info?.output_units || 'Unknown';
                     
                     let statusHtml = '';
                     if (modelStatus.download_status && Object.keys(modelStatus.download_status).length > 0) {
@@ -1079,7 +1195,7 @@ def home():
                 formData.append('video', file);
                 
                 const uploadStatus = document.getElementById('uploadStatus');
-                uploadStatus.innerHTML = 'Uploading video...';
+                uploadStatus.innerHTML = 'Uploading video for frame-based analysis...';
                 uploadStatus.className = 'status info';
                 
                 try {
@@ -1091,7 +1207,7 @@ def home():
                     const result = await response.json();
                     
                     if (result.success) {
-                        uploadStatus.innerHTML = `Video uploaded successfully! Job ID: ${result.job_id}`;
+                        uploadStatus.innerHTML = `Video uploaded successfully! Job ID: ${result.job_id}<br>Method: ${result.analysis_method}`;
                         uploadStatus.className = 'status success';
                         refreshJobs();
                         startJobPolling();
@@ -1124,16 +1240,20 @@ def home():
                                 jobsHtml += `
                                     <div class="job-item ${statusClass}">
                                         <strong>Job ${job.job_id.substring(0, 8)}</strong> - ${job.filename}<br>
+                                        <span class="method-badge">${job.analysis_method}</span><br>
                                         Status: ${job.status} | Progress: ${job.progress}%<br>
+                                        ${job.frames_extracted ? `Frames Extracted: ${job.frames_extracted} | ` : ''}
+                                        ${job.frames_analyzed ? `Frames Analyzed: ${job.frames_analyzed}` : ''}
                                         ${job.status === 'processing' ? `
                                             <div class="progress">
                                                 <div class="progress-bar" style="width: ${job.progress}%"></div>
                                             </div>
                                         ` : ''}
                                         ${job.status === 'completed' ? `
-                                            <strong>Wildfire Detected:</strong> ${job.wildfire_detected ? 'Yes ⚠️' : 'No ✅'} | 
+                                            <br><strong>Wildfire Detected:</strong> ${job.wildfire_detected ? 'Yes ⚠️' : 'No ✅'} | 
                                             <strong>Detections:</strong> ${job.total_detections || 0}<br>
-                                            <button onclick="downloadResults('${job.job_id}')" class="btn">📄 Download Results</button>
+                                            <button onclick="downloadResults('${job.job_id}')" class="btn">📄 Download JSON</button>
+                                            <button onclick="downloadCSV('${job.job_id}')" class="btn">📊 Download CSV</button>
                                             <button onclick="viewResults('${job.job_id}')" class="btn">👁️ View Results</button>
                                         ` : ''}
                                     </div>
@@ -1152,6 +1272,10 @@ def home():
                 window.open(`/download_results/${jobId}`, '_blank');
             }
             
+            async function downloadCSV(jobId) {
+                window.open(`/download_csv/${jobId}`, '_blank');
+            }
+            
             async function viewResults(jobId) {
                 try {
                     const response = await fetch(`/job_results/${jobId}`);
@@ -1161,9 +1285,17 @@ def home():
                         const resultsWindow = window.open('', '_blank');
                         resultsWindow.document.write(`
                             <html>
-                                <head><title>Analysis Results - ${jobId}</title></head>
+                                <head><title>Frame-based Analysis Results - ${jobId}</title></head>
                                 <body>
-                                    <h1>Wildfire Detection Results</h1>
+                                    <h1>Wildfire Detection Results (Frame Inference)</h1>
+                                    <h2>Summary</h2>
+                                    <p><strong>Method:</strong> ${result.results.analysis_method}</p>
+                                    <p><strong>Frames Analyzed:</strong> ${result.results.total_frames_analyzed}</p>
+                                    <p><strong>Wildfire Detected:</strong> ${result.results.summary.wildfire_detected ? 'Yes' : 'No'}</p>
+                                    <p><strong>Total Detections:</strong> ${result.results.summary.total_detections}</p>
+                                    <p><strong>Risk Percentage:</strong> ${result.results.summary.risk_percentage.toFixed(2)}%</p>
+                                    
+                                    <h2>Full Results</h2>
                                     <pre>${JSON.stringify(result.results, null, 2)}</pre>
                                 </body>
                             </html>
@@ -1221,7 +1353,7 @@ if __name__ == '__main__':
     worker_thread = threading.Thread(target=inference_worker, daemon=True)
     worker_thread.start()
     
-    log_message("INFO", "🔥 Wildfire Detection Server Starting...")
+    log_message("INFO", "🔥 Wildfire Detection Server Starting with Frame Inference Method...")
     log_message("INFO", f"📹 Server will be available at: http://0.0.0.0:5000")
     
     try:
