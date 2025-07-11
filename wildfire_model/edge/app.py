@@ -55,6 +55,14 @@ except ImportError as e:
     print("Make sure python_modules/model_management/model_manager.py and python_modules/inference_engine/inference_engine.py exist")
     sys.exit(1)
 
+# Import EdgeVarianceCalculator for active learning
+try:
+    from python_modules.active_learning.edge_variance_calculator import EdgeVarianceCalculator
+    print("✅ EdgeVarianceCalculator imported successfully")
+except ImportError as e:
+    print(f"❌ EdgeVarianceCalculator import error: {e}")
+    EdgeVarianceCalculator = None
+
 # Continue with other imports
 from werkzeug.utils import secure_filename
 import uuid
@@ -86,6 +94,7 @@ MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', 100 * 1024 * 1024))
 GITHUB_DOWNLOAD_TIMEOUT = int(os.getenv('GITHUB_DOWNLOAD_TIMEOUT', 300))
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv', 'wmv'}
 IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'bmp', 'tiff', 'tif'}
+FINE_TUNE_SERVER_URL = os.getenv('FINE_TUNE_SERVER_URL', 'http://localhost:5002')
 
 print(f"📁 Configuration:")
 print(f"  - Upload folder: {UPLOAD_FOLDER}")
@@ -115,6 +124,9 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 model_manager = ModelManager(MODEL_CACHE_DIR, logger)
 inference_engine = InferenceEngine(FRAMES_FOLDER, logger)
 
+# Initialize EdgeVarianceCalculator (will be set when model is loaded)
+edge_variance_calculator = None
+
 # Global variables for Flask app state
 model = None
 inference_queue = Queue()
@@ -130,6 +142,9 @@ model_download_status = {
     'last_updated': datetime.now().isoformat()
 }
 current_inference_logs = {}
+
+# Global variable for active learning
+edge_variance_calculator = None
 
 # Import BasicVideoInference
 try:
@@ -167,6 +182,23 @@ def log_message(level, message, job_id=None, category='SYSTEM'):
     # Also log to standard logger
     getattr(logger, level.lower(), logger.info)(f"[{category}] {message}")
 
+def safe_count_params(model_or_weights):
+    """Safely count parameters handling different TensorFlow versions"""
+    try:
+        if hasattr(model_or_weights, 'count_params'):
+            return model_or_weights.count_params()
+        elif isinstance(model_or_weights, list):
+            # For weight lists, use numpy
+            total = 0
+            for w in model_or_weights:
+                if hasattr(w, 'shape'):
+                    total += np.prod(w.shape)
+            return int(total)
+        else:
+            return 'Unknown'
+    except Exception:
+        return 'Unknown'
+
 def get_model_basic_info():
     """Get basic model information"""
     if model is None:
@@ -177,7 +209,7 @@ def get_model_basic_info():
             'loaded': True,
             'input_shape': str(model.input_shape),
             'output_shape': str(model.output_shape),
-            'parameters': model.count_params()
+            'parameters': safe_count_params(model)
         }
     except Exception as e:
         return {
@@ -203,9 +235,9 @@ def get_model_detailed_info():
             'model_type': type(model).__name__,
             'input_shape': str(model.input_shape) if hasattr(model, 'input_shape') else 'Unknown',
             'output_shape': str(model.output_shape) if hasattr(model, 'output_shape') else 'Unknown',
-            'total_params': model.count_params() if hasattr(model, 'count_params') else 'Unknown',
-            'trainable_params': sum([tf.keras.utils.count_params(w) for w in model.trainable_weights]) if hasattr(model, 'trainable_weights') else 'Unknown',
-            'non_trainable_params': sum([tf.keras.utils.count_params(w) for w in model.non_trainable_weights]) if hasattr(model, 'non_trainable_weights') else 'Unknown',
+            'total_params': safe_count_params(model),
+            'trainable_params': safe_count_params(model.trainable_weights) if hasattr(model, 'trainable_weights') else 'Unknown',
+            'non_trainable_params': safe_count_params(model.non_trainable_weights) if hasattr(model, 'non_trainable_weights') else 'Unknown',
             'layers': len(model.layers) if hasattr(model, 'layers') else 'Unknown',
             'model_size_mb': get_model_size_mb(),
             'model_path': getattr(model_manager, 'current_model_path', 'Unknown'),
@@ -227,11 +259,14 @@ def get_model_size_mb():
             return 0
         
         # Calculate approximate size based on parameters
-        total_params = model.count_params()
-        # Assuming float32 (4 bytes per parameter)
-        size_bytes = total_params * 4
-        size_mb = size_bytes / (1024 * 1024)
-        return round(size_mb, 2)
+        total_params = safe_count_params(model)
+        if isinstance(total_params, (int, float)):
+            # Assuming float32 (4 bytes per parameter)
+            size_bytes = total_params * 4
+            size_mb = size_bytes / (1024 * 1024)
+            return round(size_mb, 2)
+        else:
+            return 0
         
     except Exception as e:
         return 0
@@ -257,10 +292,9 @@ def analyze_video_with_basic_inference(video_path, job_id):
         active_jobs[job_id]['progress'] = 10
         
         # Create BasicVideoInference instance
-        frames_dir = os.path.join(FRAMES_FOLDER, job_id)
         basic_inference = BasicVideoInference(
             model=model,
-            frames_output_dir=frames_dir,
+            frames_output_dir=FRAMES_FOLDER,
             logger=logger
         )
         
@@ -440,7 +474,7 @@ def validate_model_file(filepath):
                 model_info = {
                     'input_shape': str(test_model.input_shape) if hasattr(test_model, 'input_shape') else 'Unknown',
                     'output_shape': str(test_model.output_shape) if hasattr(test_model, 'output_shape') else 'Unknown',
-                    'parameters': model.count_params() if hasattr(test_model, 'count_params') else 'Unknown'
+                    'parameters': safe_count_params(test_model)
                 }
                 log_message("SUCCESS", f"✅ Model validation successful: {model_info}", None, "VALIDATION")
                 return {
@@ -492,7 +526,6 @@ def load_model_from_url(github_url, force_download=False):
         if not filename or '.' not in filename:
             filename = 'downloaded_model.h5'
         
-        model_path = os.path.join(MODEL_CACHE_DIR, filename)
         
         # Check if file already exists and force_download is False
         if os.path.exists(model_path) and not force_download:
@@ -553,6 +586,10 @@ def load_model_from_url(github_url, force_download=False):
         }
         
         log_message("SUCCESS", f"Model loaded successfully from {github_url}", None, "MODEL_LOAD")
+        
+        # Initialize EdgeVarianceCalculator for active learning
+        initialize_edge_variance_calculator()
+        
         return True
         
     except Exception as e:
@@ -582,15 +619,18 @@ def load_initial_model():
     """Load initial model (dummy or from local file)"""
     global model
     
-    # Try to load from local file first
-    local_model_path = os.path.join(MODEL_CACHE_DIR, 'wildfire_model.h5')
+    # Try to load from local file first using ModelManager
+    local_model_path = os.path.join(MODEL_CACHE_DIR, 'best_model.h5')
     
     try:
         if os.path.exists(local_model_path):
-            model = tf.keras.models.load_model(local_model_path)
-            log_message("INFO", f"Model loaded from local file: {local_model_path}", None, "MODEL")
-            log_model_details(model, {'source': local_model_path})
-            return True
+            # Use ModelManager to load the model (this will set current_model_path)
+            success = model_manager.load_model_from_file(local_model_path)
+            if success:
+                model = model_manager.get_current_model()
+                log_message("INFO", f"Model loaded from local file: {local_model_path}", None, "MODEL")
+                log_model_details(model, {'source': local_model_path})
+                return True
     except Exception as e:
         log_message("WARNING", f"Failed to load local model: {e}", None, "MODEL")
     
@@ -614,11 +654,30 @@ def log_model_details(model, info):
             log_message("INFO", f"Input shape: {model.input_shape}")
         if hasattr(model, 'output_shape'):
             log_message("INFO", f"Output shape: {model.output_shape}")
-        if hasattr(model, 'count_params'):
-            log_message("INFO", f"Parameters: {model.count_params()}")
+        
+        params = safe_count_params(model)
+        if params != 'Unknown':
+            log_message("INFO", f"Parameters: {params}")
             
     except Exception as e:
         log_message("ERROR", f"Error logging model details: {e}")
+
+# Function definitions
+def initialize_edge_variance_calculator():
+    """Initialize EdgeVarianceCalculator for active learning"""
+    global edge_variance_calculator
+    
+    try:
+        if EdgeVarianceCalculator is not None and model is not None:
+            edge_variance_calculator = EdgeVarianceCalculator(
+                model=model,
+                fine_tune_server_url=FINE_TUNE_SERVER_URL
+            )
+            log_message("INFO", "EdgeVarianceCalculator initialized successfully")
+        else:
+            log_message("WARNING", "Cannot initialize EdgeVarianceCalculator: EdgeVarianceCalculator class or model not available")
+    except Exception as e:
+        log_message("ERROR", f"Failed to initialize EdgeVarianceCalculator: {e}")
 
 # Flask Routes
 
@@ -666,7 +725,6 @@ def logs_page():
                 font-size: 13px;
                 line-height: 1.4;
             }
-            .log-entry { 
                 margin-bottom: 8px; 
                 padding: 6px 8px; 
                 border-radius: 4px;
@@ -860,14 +918,9 @@ def logs_page():
         <button class="auto-scroll" id="scrollBtn" onclick="scrollToBottom()" title="Scroll to bottom">⬇️</button>
         
         <script>
-            let autoRefreshEnabled = true;
-            let refreshInterval;
-            let allLogs = [];
-            let filteredLogs = [];
             
             function toggleAutoRefresh() {
                 autoRefreshEnabled = !autoRefreshEnabled;
-                const btn = document.getElementById('autoRefresh');
                 
                 if (autoRefreshEnabled) {
                     btn.textContent = '🔄 Auto Refresh';
@@ -894,9 +947,6 @@ def logs_page():
             }
             
             async function refreshLogs() {
-                try {
-                    const response = await fetch('/api/logs');
-                    const data = await response.json();
                     
                     if (data.success) {
                         allLogs = data.logs;
@@ -906,7 +956,6 @@ def logs_page():
                         
                         document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
                     }
-                } catch (error) {
                     console.error('Error fetching logs:', error);
                 }
             }
@@ -919,15 +968,9 @@ def logs_page():
             }
             
             function updateModelInfo(modelInfo) {
-                let html = '';
                 if (modelInfo.model_loaded) {
                     html = `
                         <strong>Status:</strong> ✅ Loaded<br>
-                        <strong>Source:</strong> ${modelInfo.source || 'Unknown'}<br>
-                        <strong>Input Shape:</strong> ${modelInfo.input_shape || 'Unknown'}<br>
-                        <strong>Output Shape:</strong> ${modelInfo.output_shape || 'Unknown'}<br>
-                        <strong>Parameters:</strong> ${(modelInfo.parameters || 0).toLocaleString()}<br>
-                        <strong>Output Units:</strong> ${modelInfo.output_units || 'Unknown'}
                     `;
                 } else {
                     html = '<strong>Status:</strong> ❌ No model loaded';
@@ -936,35 +979,20 @@ def logs_page():
             }
             
             function applyFilters() {
-                const levelFilter = document.getElementById('levelFilter').value;
-                const categoryFilter = document.getElementById('categoryFilter').value;
-                const jobFilter = document.getElementById('jobFilter').value.toLowerCase();
-                const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
                 
                 filteredLogs = allLogs.filter(log => {
-                    if (levelFilter && log.level !== levelFilter) return false;
-                    if (categoryFilter && log.category !== categoryFilter) return false;
-                    if (jobFilter && (!log.job_id || !log.job_id.toLowerCase().includes(jobFilter))) return false;
-                    if (searchFilter && !log.message.toLowerCase().includes(searchFilter)) return false;
                     return true;
-                });
                 
                 displayLogs();
             }
             
             function displayLogs() {
-                const container = document.getElementById('logContainer');
-                const shouldScrollToBottom = isScrolledToBottom();
                 
-                if (filteredLogs.length === 0) {
                     container.innerHTML = '<div style="text-align: center; color: #888; padding: 50px;">No logs match current filters</div>';
                     return;
                 }
                 
-                let html = '';
                 filteredLogs.slice(-1000).forEach(log => { // Show last 1000 logs
-                    const timestamp = new Date(log.timestamp).toLocaleTimeString();
-                    const jobId = log.job_id ? `[${log.job_id.substring(0, 8)}]` : '';
                     
                     html += `
                         <div class="log-entry ${log.level} ${log.category}">
@@ -975,7 +1003,6 @@ def logs_page():
                             <span class="message">${escapeHtml(log.message)}</span>
                         </div>
                     `;
-                });
                 
                 container.innerHTML = html;
                 
@@ -985,12 +1012,10 @@ def logs_page():
             }
             
             function isScrolledToBottom() {
-                const container = document.getElementById('logContainer');
                 return container.scrollTop + container.clientHeight >= container.scrollHeight - 10;
             }
             
             function scrollToBottom() {
-                const container = document.getElementById('logContainer');
                 container.scrollTop = container.scrollHeight;
             }
             
@@ -999,7 +1024,6 @@ def logs_page():
             }
             
             function escapeHtml(text) {
-                const div = document.createElement('div');
                 div.textContent = text;
                 return div.innerHTML;
             }
@@ -1009,7 +1033,6 @@ def logs_page():
             
             // Update scroll button visibility
             document.getElementById('logContainer').addEventListener('scroll', function() {
-                const scrollBtn = document.getElementById('scrollBtn');
                 if (isScrolledToBottom()) {
                     scrollBtn.style.opacity = '0.3';
                 } else {
@@ -1040,7 +1063,7 @@ def api_logs():
             'source': model_url or 'local/dummy',
             'input_shape': str(model.input_shape) if model else None,
             'output_shape': str(model.output_shape) if model else None,
-            'parameters': model.count_params() if model else None,
+            'parameters': safe_count_params(model) if model else None,
             'output_units': model.output_shape[-1] if model else None
         };
         
@@ -1241,7 +1264,11 @@ def upload_model():
         
         if success:
             global model
-            model = model_manager.get_current_model()
+            model = model_manager.get_current_model();
+            
+            # Initialize EdgeVarianceCalculator for active learning
+            initialize_edge_variance_calculator();
+            
             return jsonify({
                 'success': True,
                 'message': 'Model uploaded and loaded successfully',
@@ -1260,7 +1287,7 @@ def upload_model():
             'error': str(e)
         }), 500
 
-# Load model from URL endpoint
+# Load model from URL endpoint  
 @app.route('/load_model', methods=['POST'])
 def load_model():
     """Load model from GitHub URL"""
@@ -1272,20 +1299,37 @@ def load_model():
                 'error': 'No URL provided'
             }), 400
         
-        github_url = data['url']
+        url = data['url']
         force_download = data.get('force_download', False)
         
         # Load model using model manager
-        success = model_manager.load_model_from_url(github_url, force_download)
+        success = model_manager.load_model_from_url(url, force_download)
         
         if success:
+            # Update global model variable
             global model
+            old_model = model
             model = model_manager.get_current_model()
+            
+            # Debug logging
+            log_message("INFO", f"Model loading completed. Old model: {type(old_model).__name__ if old_model else 'None'}")
+            log_message("INFO", f"New model: {type(model).__name__ if model else 'None'}")
+            if model:
+                log_message("INFO", f"New model params: {safe_count_params(model)}")
+                log_message("INFO", f"New model input shape: {getattr(model, 'input_shape', 'Unknown')}")
+            
+            # Initialize EdgeVarianceCalculator for active learning
+            initialize_edge_variance_calculator()
+            
             return jsonify({
                 'success': True,
                 'message': 'Model loaded successfully',
                 'model_info': get_model_basic_info(),
-                'url': github_url
+                'url': url,
+                'debug_info': {
+                    'model_type': type(model).__name__ if model else 'None',
+                    'model_params': safe_count_params(model) if model else 'None'
+                }
             })
         else:
             return jsonify({
@@ -1299,6 +1343,7 @@ def load_model():
             'error': str(e)
         }), 500
 
+
 # Get current model status
 @app.route('/get_current_model_status')
 def get_current_model_status():
@@ -1310,7 +1355,7 @@ def get_current_model_status():
                 'error': 'No model loaded'
             })
         
-        model_info = get_model_detailed_info();
+        model_info = get_model_detailed_info()
         return jsonify({
             'model_loaded': True,
             'model_info': model_info,
@@ -1323,6 +1368,7 @@ def get_current_model_status():
             'model_loaded': False,
             'error': str(e)
         }), 500
+
 
 # Upload and analyze video endpoint
 @app.route('/upload_and_analyze', methods=['POST'])
@@ -1365,37 +1411,30 @@ def upload_and_analyze():
         # Save uploaded file
         filename = secure_filename(file.filename)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        unique_filename = f"{timestamp}_{job_id[:8]}_{filename}"
+        unique_filename = f"{timestamp}_{filename}"
         video_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        file.save(video_path)
         
-        file.save(video_path);
-        
-        # Create job record
+        # Start analysis in background
         active_jobs[job_id] = {
-            'job_id': job_id,
-            'filename': filename,
-            'video_path': video_path,
-            'status': 'queued',
-            'progress': 0,
-            'created_at': datetime.now().isoformat(),
-            'file_size': os.path.getsize(video_path),
-            'current_stage': 'Queued'
+            'status': 'processing',
+            'filename': unique_filename,
+            'upload_time': datetime.now().isoformat(),
+            'progress': 0
         }
         
-        # Add to inference queue
-        inference_queue.put({
-            'job_id': job_id,
-            'video_path': video_path
-        })
-        
-        log_message("INFO", f"Video uploaded and queued for analysis: {filename}", job_id)
+        # Process video in background
+        thread = threading.Thread(
+            target=analyze_video_with_basic_inference,
+            args=(video_path, job_id)
+        )
+        thread.start();
         
         return jsonify({
             'success': True,
             'job_id': job_id,
-            'message': 'Video uploaded successfully and queued for analysis',
-            'filename': filename,
-            'queue_position': inference_queue.qsize()
+            'filename': unique_filename,
+            'message': 'Video uploaded successfully, analysis started'
         })
         
     except Exception as e:
@@ -1404,16 +1443,130 @@ def upload_and_analyze():
             'error': str(e)
         }), 500
 
-# Get all jobs endpoint
-@app.route('/jobs')
-def get_all_jobs():
-    """Get status of all jobs"""
+# Debug endpoints for model management
+@app.route('/debug/force_reload_model', methods=['POST'])
+def debug_force_reload_model():
+    """Debug endpoint to force reload model from cache"""
     try:
+        data = request.get_json() or {}
+        model_filename = data.get('model_filename', 'best_model.h5')
+        
+        # Log current model state
+        global model
+        old_model_info = {
+            'type': type(model).__name__ if model else 'None',
+            'params': safe_count_params(model) if model else 'None',
+            'input_shape': getattr(model, 'input_shape', 'Unknown') if model else 'Unknown'
+        }
+        
+        log_message("DEBUG", f"Force reload requested for model: {model_filename}")
+        log_message("DEBUG", f"Current model before reload: {old_model_info}")
+        
+        # Try to load model from cache
+        model_path = os.path.join(MODEL_CACHE_DIR, model_filename)
+        
+        if not os.path.exists(model_path):
+            return jsonify({
+                'success': False,
+                'error': f'Model file not found: {model_path}',
+                'available_models': [f for f in os.listdir(MODEL_CACHE_DIR) if f.endswith(('.h5', '.keras'))]
+            }), 404
+        
+        # Load the model
+        success = model_manager.load_model_from_file(model_path)
+        
+        if success:
+            # Update global model variable
+            model = model_manager.get_current_model()
+            
+            new_model_info = {
+                'type': type(model).__name__ if model else 'None',
+                'params': safe_count_params(model) if model else 'None',
+                'input_shape': getattr(model, 'input_shape', 'Unknown') if model else 'Unknown'
+            }
+            
+            log_message("DEBUG", f"Model reloaded successfully. New model: {new_model_info}")
+            
+            # Re-initialize EdgeVarianceCalculator
+            initialize_edge_variance_calculator()
+            
+            return jsonify({
+                'success': True,
+                'message': f'Model {model_filename} reloaded successfully',
+                'old_model': old_model_info,
+                'new_model': new_model_info,
+                'model_path': model_path
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': f'Failed to load model from {model_path}'
+            }), 500
+            
+    except Exception as e:
+        log_message("ERROR", f"Debug force reload failed: {e}")
         return jsonify({
-            'success': True,
-            'jobs': list(active_jobs.values()),
-            'total_jobs': len(active_jobs),
-            'queue_size': inference_queue.qsize(),
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/debug/model_status')
+def debug_model_status():
+    """Debug endpoint to check detailed model status"""
+    try:
+        global model
+        
+        # Get current model info
+        current_model_info = {
+            'global_model_type': type(model).__name__ if model else 'None',
+            'global_model_params': safe_count_params(model) if model else 'None',
+            'global_model_input_shape': getattr(model, 'input_shape', 'Unknown') if model else 'Unknown',
+            'global_model_id': id(model) if model else None
+        }
+        
+        # Get model manager info
+        manager_model = model_manager.get_current_model()
+        manager_model_info = {
+            'manager_model_type': type(manager_model).__name__ if manager_model else 'None',
+            'manager_model_params': safe_count_params(manager_model) if manager_model else 'None',
+            'manager_model_input_shape': getattr(manager_model, 'input_shape', 'Unknown') if manager_model else 'Unknown',
+            'manager_model_id': id(manager_model) if manager_model else None
+        }
+        
+        # Check if they're the same object
+        models_match = (model is manager_model)
+        
+        # List available models in cache
+        available_models = []
+        if os.path.exists(MODEL_CACHE_DIR):
+            for filename in os.listdir(MODEL_CACHE_DIR):
+                if filename.endswith(('.h5', '.keras')):
+                    filepath = os.path.join(MODEL_CACHE_DIR, filename)
+                    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                    available_models.append({
+                        'filename': filename,
+                        'size_mb': round(size_mb, 2),
+                        'path': filepath
+                    })
+        
+        # Check for dummy model characteristics
+        is_dummy_model = False
+        if model and hasattr(model, 'count_params'):
+            param_count = model.count_params()
+            input_shape = getattr(model, 'input_shape', None)
+            # Common dummy model characteristics
+            if param_count == 2123813 and str(input_shape) == '(None, 128, 128, 3)':
+                is_dummy_model = True
+        
+        return jsonify({
+            'current_model': current_model_info,
+            'manager_model': manager_model_info,
+            'models_match': models_match,
+            'is_dummy_model': is_dummy_model,
+            'available_models': available_models,
+            'cache_directory': MODEL_CACHE_DIR,
+            'edge_variance_calculator_initialized': edge_variance_calculator is not None,
             'timestamp': datetime.now().isoformat()
         })
         
@@ -1423,23 +1576,14 @@ def get_all_jobs():
             'error': str(e)
         }), 500
 
-# Main execution block
+
 if __name__ == '__main__':
-    # Start the inference worker in a separate thread
-    worker_thread = threading.Thread(target=inference_worker, daemon=True)
-    worker_thread.start()
+    print("🚀 Starting wildfire detection server...")
     
     # Load initial model
-    try:
-        model_manager.load_initial_model()
-        model = model_manager.get_current_model()
-        if model:
-            log_message("SUCCESS", "Initial model loaded successfully")
-        else:
-            log_message("INFO", "No initial model found, will load when requested")
-    except Exception as e:
-        log_message("ERROR", f"Failed to load initial model: {e}")
+    load_initial_model()
     
-    # Start Flask app
-    log_message("INFO", "Starting Flask application...")
+    # Start the Flask app
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+
+

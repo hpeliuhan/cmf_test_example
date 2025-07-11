@@ -7,8 +7,27 @@ import hashlib
 import json
 import requests
 import tensorflow as tf
+import numpy as np
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
+
+
+def safe_count_params(model_or_weights):
+    """Safely count parameters handling different TensorFlow versions"""
+    try:
+        if hasattr(model_or_weights, 'count_params'):
+            return model_or_weights.count_params()
+        elif isinstance(model_or_weights, list):
+            # For weight lists, use numpy
+            total = 0
+            for w in model_or_weights:
+                if hasattr(w, 'shape'):
+                    total += np.prod(w.shape)
+            return int(total)
+        else:
+            return 'Unknown'
+    except Exception:
+        return 'Unknown'
 
 
 class ModelManager:
@@ -17,11 +36,30 @@ class ModelManager:
         self.logger = logger
         self.model = None
         self.model_url = None
+        self.current_model_path = None  # Track the path of the currently loaded model
         self.model_download_status = {}
         self.current_model_info = {}
         
+        # Log cache directory for debugging
+        self.logger.info(f"ModelManager initialized with cache dir: {model_cache_dir}")
+        self.logger.info(f"Absolute cache dir path: {os.path.abspath(model_cache_dir)}")
+        
         # Ensure model cache directory exists
         os.makedirs(model_cache_dir, exist_ok=True)
+        self.logger.info(f"Model cache directory created/verified: {model_cache_dir}")
+        
+        # Log directory permissions and contents for debugging
+        try:
+            stat_info = os.stat(model_cache_dir)
+            self.logger.info(f"Cache dir permissions: {oct(stat_info.st_mode)[-3:]}")
+            contents = os.listdir(model_cache_dir)
+            self.logger.info(f"Cache dir contents: {len(contents)} items")
+            if contents:
+                h5_files = [f for f in contents if f.endswith('.h5')]
+                if h5_files:
+                    self.logger.info(f"Existing .h5 files: {h5_files}")
+        except Exception as e:
+            self.logger.warning(f"Could not get cache dir info: {e}")
     
     def download_model_from_github(self, url: str, destination_path: str) -> Dict[str, Any]:
         """Download model from GitHub URL"""
@@ -333,12 +371,24 @@ class ModelManager:
                 return False
             
             self.logger.info(f"Loading model from file: {model_path}")
+            self.logger.info(f"Model file exists: {os.path.exists(model_path)}")
+            self.logger.info(f"Model file size: {os.path.getsize(model_path) / (1024*1024):.1f} MB")
+            
             model = tf.keras.models.load_model(model_path)
             
             if model is not None:
                 self.model = model
                 self.model_url = f"file://{model_path}"
-                self.logger.info("Model loaded successfully from file")
+                self.current_model_path = model_path  # Track the current model path
+                
+                # Log model characteristics for debugging
+                params = safe_count_params(model)
+                self.logger.info(f"Model loaded successfully from file")
+                self.logger.info(f"Model type: {type(model).__name__}")
+                self.logger.info(f"Model parameters: {params}")
+                self.logger.info(f"Model input shape: {getattr(model, 'input_shape', 'Unknown')}")
+                self.logger.info(f"Model output shape: {getattr(model, 'output_shape', 'Unknown')}")
+                
                 return True
             else:
                 self.logger.error("Failed to load model from file")

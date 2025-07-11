@@ -18,6 +18,9 @@ data:
   # Logging
   LOG_LEVEL: "INFO"
   MAX_LOG_ENTRIES: "1000"
+  
+  # Active Learning Configuration
+  FINE_TUNE_SERVER_URL: "http://localhost:5002"
 
 ---
 apiVersion: v1
@@ -76,6 +79,26 @@ spec:
         runAsUser: 1000
         runAsGroup: 1000
         
+      # Add init container to set proper permissions
+      initContainers:
+      - name: volume-permissions
+        image: busybox:1.35
+        command: ['sh', '-c']
+        args:
+        - |
+          chown -R 1000:1000 /app/models /app/videos /app/results
+          chmod -R 755 /app/models /app/videos /app/results
+          echo "Volume permissions set"
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - name: models-storage
+          mountPath: /app/models
+        - name: videos-storage
+          mountPath: /app/videos
+        - name: results-storage
+          mountPath: /app/results
+        
       containers:
       - name: wifire-al
         image: localhost:5000/wifire-al:latest
@@ -89,6 +112,11 @@ spec:
         - name: TF_CPP_MIN_LOG_LEVEL
           value: "2"
         
+        # Add environment variables from ConfigMap
+        envFrom:
+        - configMapRef:
+            name: wildfire-config
+        
         # Mount the PVCs for persistent storage
         volumeMounts:
         - name: models-storage
@@ -100,11 +128,11 @@ spec:
         
         resources:
           requests:
-            memory: "512Mi"
-            cpu: "250m"
+            memory: "1Gi"
+            cpu: "500m"
           limits:
-            memory: "2Gi"
-            cpu: "1000m"
+            memory: "4Gi"
+            cpu: "2000m"
         
         # Container security context
         securityContext:
